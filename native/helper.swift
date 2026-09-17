@@ -73,15 +73,41 @@ func findWindow(query: String) -> WindowInfo? {
     return all.first(where: { $0.owner.lowercased().contains(lower) || $0.title.lowercased().contains(lower) })
 }
 
+func activateIPhoneMirroring() {
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.ScreenContinuity")
+    if let app = apps.first, !app.isActive {
+        app.activate()
+        usleep(250_000) // give focus time to settle before sending input
+    }
+}
+
 func clickAt(x: Double, y: Double) {
     let point = CGPoint(x: x, y: y)
-    guard let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-          let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
+
+    // iPhone Mirroring only registers taps that look like real touch input:
+    // the system cursor must actually be at the target point (not just the
+    // event's embedded coordinate), and a bare down/up with no movement in
+    // between is frequently swallowed. Warp the cursor, nudge it, then send
+    // the click through the real HID event source.
+    CGWarpMouseCursorPosition(point)
+    usleep(20_000)
+
+    let source = CGEventSource(stateID: .hidSystemState)
+
+    guard let moved = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left),
+          let mouseDown = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+          let nudge = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged, mouseCursorPosition: CGPoint(x: point.x + 1, y: point.y), mouseButton: .left),
+          let mouseUp = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
         fputs("Failed to create mouse event\n", stderr)
         return
     }
+
+    moved.post(tap: .cghidEventTap)
+    usleep(20_000)
     mouseDown.post(tap: .cghidEventTap)
-    usleep(50_000) // 50ms hold
+    usleep(30_000)
+    nudge.post(tap: .cghidEventTap)
+    usleep(30_000)
     mouseUp.post(tap: .cghidEventTap)
 }
 
@@ -201,6 +227,7 @@ case "click":
         fputs("Invalid coordinates\n", stderr)
         exit(1)
     }
+    activateIPhoneMirroring()
     clickAt(x: x, y: y)
     print("{\"success\": true, \"x\": \(x), \"y\": \(y)}")
 
@@ -212,6 +239,7 @@ case "tap-sequence":
         exit(1)
     }
     let delayMs = args.count > 6 ? (UInt32(args[6]) ?? 150) : 150
+    activateIPhoneMirroring()
     clickAt(x: x1, y: y1)
     usleep(delayMs * 1000)
     clickAt(x: x2, y: y2)
