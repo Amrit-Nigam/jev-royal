@@ -224,7 +224,7 @@ Schema:
 export async function perceiveGameStateWithClaude(
   imageBase64: string,
   apiKey: string,
-  model = 'claude-3-5-sonnet-20241022'
+  model = 'claude-haiku-4-5-20251001'
 ): Promise<GameState> {
   const anthropic = new Anthropic({ apiKey });
 
@@ -304,7 +304,7 @@ export async function perceiveGameState(
   if (provider === 'openai' && (options.openAiApiKey || process.env.OPENAI_API_KEY)) {
     const key = options.openAiApiKey || process.env.OPENAI_API_KEY!;
     try {
-      return await perceiveGameStateWithOpenAI(imageBase64, key, options.visionModel || 'gpt-4o-mini');
+      return await perceiveGameStateWithOpenAI(imageBase64, key, options.visionModel || process.env.VISION_MODEL || 'gpt-4o-mini');
     } catch (err) {
       console.warn(
         `[perceive:openai] OpenAI vision call failed (${(err as Error).message}). Falling back to local Apple Vision.`
@@ -317,7 +317,7 @@ export async function perceiveGameState(
   if (provider === 'anthropic' && (options.anthropicApiKey || process.env.ANTHROPIC_API_KEY)) {
     const key = options.anthropicApiKey || process.env.ANTHROPIC_API_KEY!;
     try {
-      return await perceiveGameStateWithClaude(imageBase64, key, options.visionModel);
+      return await perceiveGameStateWithClaude(imageBase64, key, options.visionModel || process.env.VISION_MODEL);
     } catch (err) {
       console.warn(
         `[perceive:anthropic] Anthropic vision call failed (${(err as Error).message}). Falling back to local Apple Vision.`
