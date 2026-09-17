@@ -1,4 +1,5 @@
 import { choice, noul, TypeSafeClient } from '@typesafe-ai/sdk';
+import { findBestKnownCounter, getCardKnowledge } from './cards.js';
 import type { GameState, JevDecision, PlacementLane } from './types.js';
 
 export interface DecideOptions {
@@ -19,18 +20,39 @@ export async function decideMove(
     throw new Error('TYPESAFE_API_KEY is not configured in environment or .env');
   }
 
-  // Find cards in hand
-  const slot1 = gameState.cardsInHand.find((c) => c.slot === 1)?.name || 'Empty slot 1';
-  const slot2 = gameState.cardsInHand.find((c) => c.slot === 2)?.name || 'Empty slot 2';
-  const slot3 = gameState.cardsInHand.find((c) => c.slot === 3)?.name || 'Empty slot 3';
-  const slot4 = gameState.cardsInHand.find((c) => c.slot === 4)?.name || 'Empty slot 4';
+  // Deterministic game knowledge (roles, targeting, known counters) is computed
+  // in code and handed to Jev as facts — Jev only judges what to do with them.
+  const opponentTroopNames = gameState.opponentTroops.map((t) => t.type);
+  const bestKnownCounter = findBestKnownCounter(
+    gameState.cardsInHand.map((c) => c.name),
+    opponentTroopNames
+  );
+
+  const describeCard = (slot: number): string => {
+    const card = gameState.cardsInHand.find((c) => c.slot === slot);
+    if (!card) return `Empty slot ${slot}`;
+    const kb = getCardKnowledge(card.name);
+    const cost = card.elixirCost ?? '?';
+    const affordable = card.isPlayable ?? (card.elixirCost !== undefined && gameState.elixir >= card.elixirCost);
+    const bits = [`${card.name} (${cost} elixir${affordable ? '' : ', NOT enough elixir yet'})`];
+    if (kb) {
+      bits.push(`role: ${kb.role}, targets: ${kb.targets}`);
+      if (kb.countersWell.length) bits.push(`good vs: ${kb.countersWell.join(', ')}`);
+      if (kb.vulnerableTo.length) bits.push(`weak vs: ${kb.vulnerableTo.join(', ')}`);
+      if (kb.notes) bits.push(kb.notes);
+    }
+    if (bestKnownCounter?.card === card.name) {
+      bits.push(`KNOWN GOOD COUNTER to opponent's ${bestKnownCounter.counters} on the field right now`);
+    }
+    return bits.join('; ');
+  };
 
   const cardChoices: Record<string, string> = {
-    slot1: `Play Slot 1: ${slot1}`,
-    slot2: `Play Slot 2: ${slot2}`,
-    slot3: `Play Slot 3: ${slot3}`,
-    slot4: `Play Slot 4: ${slot4}`,
-    none: 'Hold cards and save elixir',
+    slot1: `Play Slot 1: ${describeCard(1)}`,
+    slot2: `Play Slot 2: ${describeCard(2)}`,
+    slot3: `Play Slot 3: ${describeCard(3)}`,
+    slot4: `Play Slot 4: ${describeCard(4)}`,
+    none: 'Hold cards and save elixir: no card is a good positive-elixir-trade or defensive answer right now',
   };
 
   const laneChoices: Record<string, string> = {
@@ -52,35 +74,55 @@ export async function decideMove(
           game: 'Clash Royale',
           matchPhase: gameState.matchPhase,
           elixir: gameState.elixir,
-          cardsInHand: gameState.cardsInHand.map((c) => ({
-            slot: c.slot,
-            name: c.name,
-            elixirCost: c.elixirCost ?? null,
-            isPlayable: c.isPlayable ?? gameState.elixir >= (c.elixirCost ?? 3),
-          })),
+          cardsInHand: gameState.cardsInHand.map((c) => {
+            const kb = getCardKnowledge(c.name);
+            return {
+              slot: c.slot,
+              name: c.name,
+              elixirCost: c.elixirCost ?? null,
+              isPlayable: c.isPlayable ?? gameState.elixir >= (c.elixirCost ?? 3),
+              role: kb?.role ?? 'unknown',
+              targets: kb?.targets ?? 'unknown',
+              countersWell: kb?.countersWell ?? [],
+              vulnerableTo: kb?.vulnerableTo ?? [],
+            };
+          }),
           nextCard: gameState.nextCard ?? null,
-          opponentTroops: gameState.opponentTroops,
+          opponentTroops: gameState.opponentTroops.map((t) => ({
+            ...t,
+            knownRole: getCardKnowledge(t.type)?.role ?? 'unknown',
+          })),
           ownTroops: gameState.ownTroops,
           ownTowers: gameState.ownTowers,
           opponentTowers: gameState.opponentTowers,
           timeRemainingSeconds: gameState.timeRemainingSeconds ?? null,
           situationSummary: gameState.rawSummary || '',
+          bestKnownCounter: bestKnownCounter ?? null,
+          strategyPolicy: [
+            'Defend before you push: if an opponent troop is on our side of the river, prioritize a positive-elixir-trade defensive answer over starting a new offensive push.',
+            'A card is a good defensive answer when its role/targeting beats the threat cheaply (see each card\'s countersWell / vulnerableTo and the opponent troop\'s knownRole) — prefer that over a generic tanky unit.',
+            'Do not place swarm cards (role swarm/spirit) directly on top of a threat that has splash damage (e.g. wizard, valkyrie, bomber, baby dragon) — they will trade badly.',
+            'Air troops (targets air, e.g. minions, bats, balloon, lava hound) can only be answered by cards that target air or both — a ground-only melee card will not reach them.',
+            'Save big spells (spell_big) for grouped/clumped units or high elixir-value targets, not lone tanks with low value.',
+            'If elixir is at or near the 10 cap, play something now even if imperfect — leaking elixir at the cap is a worse trade than almost any card.',
+            'If no opponent threat is present and elixir is high, a win_condition or bridge push in cardsInHand is a good use of that elixir rather than holding.',
+          ],
         })
       ),
       questions: {
         shouldPlayNow: noul(
-          'Is now an appropriate moment to spend elixir and play a card, given our elixir count, opponent threats, or if we are near the 10 elixir cap?',
+          'Is now an appropriate moment to spend elixir and play a card, given elixir count, opponent threats on our side of the river, and the strategyPolicy rules in state?',
           {
-            true: 'Spend elixir now: either countering an incoming threat, launching a push, or cycling to avoid leaking elixir at 10',
-            false: 'Wait and save elixir: no urgent threat, or we need to build more elixir',
+            true: 'Spend elixir now: countering an incoming threat per the counter/role data, launching a push when no threat exists, or cycling to avoid leaking elixir at 10',
+            false: 'Wait and save elixir: no urgent threat and no efficient play available yet',
           }
         ),
         whichCard: choice(
-          'Which card should be played right now to maximize tactical value?',
+          'Which card should be played right now, applying the role/countersWell/vulnerableTo data and strategyPolicy in state to pick the best elixir trade or push?',
           cardChoices
         ),
         whichLane: choice(
-          'Where on the arena battlefield should this card be placed?',
+          'Where on the arena battlefield should this card be placed, given opponentTroops positions and whether this is a defensive answer or an offensive push?',
           laneChoices
         ),
       },
@@ -130,7 +172,16 @@ function fallbackHeuristic(gameState: GameState): JevDecision {
       (c) => c.elixirCost === undefined || c.elixirCost <= gameState.elixir
     );
 
-    const chosenCard = playableCards.length > 0 ? playableCards[0] : gameState.cardsInHand[0];
+    const knownCounter = hasThreat
+      ? findBestKnownCounter(
+          playableCards.map((c) => c.name),
+          gameState.opponentTroops.map((t) => t.type)
+        )
+      : null;
+
+    const chosenCard =
+      (knownCounter && playableCards.find((c) => c.name === knownCounter.card)) ||
+      (playableCards.length > 0 ? playableCards[0] : gameState.cardsInHand[0]);
     const slotKey = chosenCard ? (`slot${chosenCard.slot}` as JevDecision['whichCard']) : 'none';
 
     let targetLane: PlacementLane = 'defensive_center';
