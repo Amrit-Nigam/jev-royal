@@ -8,20 +8,20 @@ const HELPER_PATH = resolve(process.cwd(), 'bin/helper');
 
 // Calibrated normalized relative coordinates inside the iPhone Mirroring window
 export const CARD_SLOT_RELATIVE_COORDS: Record<number, { x: number; y: number }> = {
-  1: { x: 0.28, y: 0.88 },
-  2: { x: 0.43, y: 0.88 },
-  3: { x: 0.58, y: 0.88 },
-  4: { x: 0.73, y: 0.88 },
+  1: { x: 0.32, y: 0.88 },
+  2: { x: 0.50, y: 0.88 },
+  3: { x: 0.68, y: 0.88 },
+  4: { x: 0.85, y: 0.88 },
 };
 
 export const LANE_RELATIVE_COORDS: Record<PlacementLane, { x: number; y: number }> = {
-  left_bridge: { x: 0.28, y: 0.52 },
-  right_bridge: { x: 0.72, y: 0.52 },
-  defensive_left: { x: 0.30, y: 0.68 },
-  defensive_right: { x: 0.70, y: 0.68 },
-  defensive_center: { x: 0.50, y: 0.64 },
-  back_cycle_left: { x: 0.25, y: 0.80 },
-  back_cycle_right: { x: 0.75, y: 0.80 },
+  left_bridge: { x: 0.27, y: 0.47 },
+  right_bridge: { x: 0.73, y: 0.47 },
+  defensive_left: { x: 0.27, y: 0.63 },
+  defensive_right: { x: 0.73, y: 0.63 },
+  defensive_center: { x: 0.50, y: 0.60 },
+  back_cycle_left: { x: 0.27, y: 0.75 },
+  back_cycle_right: { x: 0.73, y: 0.75 },
 };
 
 export interface ActOptions {

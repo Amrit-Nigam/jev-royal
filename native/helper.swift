@@ -128,13 +128,14 @@ func analyzeImageOCR(imagePath: String) -> OcrAnalysisResult {
             detectedPhase = "post-game"
         } else if (upper.contains("OVERTIME") || upper.contains("SUDDEN DEATH")) && detectedPhase != "post-game" {
             detectedPhase = "overtime"
-        } else if (upper.contains("BATTLE") || upper.contains("EVENTS") || upper.contains("SHOP")) && item.y > 0.85 {
+        } else if (upper.contains("TIME LEFT") || upper.contains("2:") || upper.contains("1:") || upper.contains("0:")) && detectedPhase == nil {
+            detectedPhase = "in-progress"
+        } else if (upper.contains("EVENTS") || upper.contains("SHOP")) && item.y > 0.85 && detectedPhase == nil {
             detectedPhase = "menu"
         }
         
-        // Elixir detection (bottom 15% of screen, y > 0.85)
-        if item.y > 0.85 {
-            // Check if string is a number 0..10
+        // Elixir detection (bottom region y > 0.90, ignore 'Max: 10')
+        if item.y > 0.90 && !upper.contains("MAX") {
             let cleaned = item.text.trimmingCharacters(in: CharacterSet.decimalDigits.inverted)
             if let val = Double(cleaned), val >= 0 && val <= 10 {
                 detectedElixir = val
@@ -146,6 +147,11 @@ func analyzeImageOCR(imagePath: String) -> OcrAnalysisResult {
         if let num = Double(digitsOnly), num >= 500 && num <= 6000 {
             towerNumbers.append(num)
         }
+    }
+    
+    // Default to in-progress if we found tower numbers or in-battle elements
+    if detectedPhase == nil && (!towerNumbers.isEmpty || detectedElixir != nil) {
+        detectedPhase = "in-progress"
     }
     
     return OcrAnalysisResult(
