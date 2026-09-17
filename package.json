@@ -1,0 +1,34 @@
+{
+  "name": "jevgames",
+  "version": "0.1.0",
+  "description": "Autonomous Clash Royale agent powered by TypeSafe Jev and vision models via macOS iPhone Mirroring",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "test": "tsx test/test_decide.ts && tsx test/test_offense.ts && tsx test/test_act.ts",
+    "capture-test": "tsx src/index.ts --capture-only",
+    "dry-run": "tsx src/index.ts --dry-run",
+    "list-windows": "tsx src/index.ts --list-windows",
+    "compile-native": "swiftc native/helper.swift -o bin/helper"
+  },
+  "keywords": [
+    "clash-royale",
+    "typesafe",
+    "jev",
+    "automation",
+    "vision"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.126.0",
+    "@typesafe-ai/sdk": "^0.6.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}
