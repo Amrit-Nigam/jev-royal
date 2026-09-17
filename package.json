@@ -7,6 +7,7 @@
     "build": "tsc",
     "start": "tsx src/index.ts",
     "test": "tsx test/test_decide.ts && tsx test/test_offense.ts && tsx test/test_act.ts",
+    "test:local": "tsx test/test_local_pipeline.ts",
     "capture-test": "tsx src/index.ts --capture-only",
     "dry-run": "tsx src/index.ts --dry-run",
     "list-windows": "tsx src/index.ts --list-windows",

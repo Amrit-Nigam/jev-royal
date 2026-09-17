@@ -2,6 +2,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { executePlay } from './act.js';
 import { captureWindow } from './capture.js';
 import { decideMove } from './decide.js';
+import { DeckTracker } from './deck.js';
 import { perceiveGameState } from './perceive.js';
 import type { GameState, TickResult, WindowInfo } from './types.js';
 import { findTargetWindow } from './window.js';
@@ -12,6 +13,7 @@ export interface LoopOptions {
   dryRun?: boolean;
   maxTicks?: number;
   autoStopOnPostGame?: boolean;
+  deckNames?: string[];
   onTick?: (result: TickResult) => void;
 }
 
@@ -19,6 +21,7 @@ export class GameLoop {
   private isRunning = false;
   private tickCount = 0;
   private readonly options: LoopOptions;
+  private deckTracker: DeckTracker;
 
   constructor(options: LoopOptions = {}) {
     this.options = {
@@ -28,6 +31,11 @@ export class GameLoop {
       autoStopOnPostGame: true,
       ...options,
     };
+
+    const envDeck = process.env.PLAYER_DECK
+      ? process.env.PLAYER_DECK.split(',').map((s) => s.trim())
+      : undefined;
+    this.deckTracker = new DeckTracker(this.options.deckNames || envDeck);
   }
 
   public stop(): void {
@@ -50,10 +58,12 @@ export class GameLoop {
     console.log(`[capture] Captured window frame: ${filePath}`);
 
     // 2. Perceive board state
-    console.log('[perceive] Analyzing frame with vision model...');
+    console.log('[perceive] Analyzing frame with vision...');
     let gameState: GameState;
     try {
-      gameState = await perceiveGameState(base64);
+      gameState = await perceiveGameState(filePath, base64, {
+        deckTracker: this.deckTracker,
+      });
       console.log(
         `[perceive] Phase: ${gameState.matchPhase.toUpperCase()} | Elixir: ${gameState.elixir.toFixed(1)} | Hand: [${gameState.cardsInHand.map((c) => c.name).join(', ')}]`
       );
@@ -120,6 +130,10 @@ export class GameLoop {
         const slotMatch = decision.whichCard.match(/\d+/);
         const slotNum = slotMatch ? parseInt(slotMatch[0], 10) : 1;
         const cardObj = gameState.cardsInHand.find((c) => c.slot === slotNum);
+
+        // Rotate deck cycle
+        const rotatedCard = this.deckTracker.playSlot(slotNum);
+        console.log(`[deck] Played ${rotatedCard?.name || `Slot ${slotNum}`}, rotating deck cycle.`);
 
         actionTaken = {
           cardSlot: slotNum,

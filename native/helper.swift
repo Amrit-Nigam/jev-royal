@@ -1,6 +1,7 @@
 import Cocoa
 import CoreGraphics
 import Foundation
+import Vision
 
 struct WindowBounds: Codable {
     let x: Double
@@ -14,6 +15,22 @@ struct WindowInfo: Codable {
     let owner: String
     let title: String
     let bounds: WindowBounds
+}
+
+struct TextObservation: Codable {
+    let text: String
+    let confidence: Float
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
+struct OcrAnalysisResult: Codable {
+    let rawTexts: [TextObservation]
+    let detectedElixir: Double?
+    let detectedPhase: String?
+    let towerNumbers: [Double]
 }
 
 func listAllWindows() -> [WindowInfo] {
@@ -50,11 +67,9 @@ func listAllWindows() -> [WindowInfo] {
 func findWindow(query: String) -> WindowInfo? {
     let lower = query.lowercased()
     let all = listAllWindows()
-    // First try exact match on owner or title
     if let match = all.first(where: { $0.owner.lowercased() == lower || $0.title.lowercased() == lower }) {
         return match
     }
-    // Then partial match
     return all.first(where: { $0.owner.lowercased().contains(lower) || $0.title.lowercased().contains(lower) })
 }
 
@@ -70,6 +85,77 @@ func clickAt(x: Double, y: Double) {
     mouseUp.post(tap: .cghidEventTap)
 }
 
+func analyzeImageOCR(imagePath: String) -> OcrAnalysisResult {
+    guard let image = NSImage(contentsOfFile: imagePath),
+          let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return OcrAnalysisResult(rawTexts: [], detectedElixir: nil, detectedPhase: nil, towerNumbers: [])
+    }
+    
+    var items: [TextObservation] = []
+    let request = VNRecognizeTextRequest { req, err in
+        guard let obs = req.results as? [VNRecognizedTextObservation] else { return }
+        for o in obs {
+            guard let candidate = o.topCandidates(1).first else { continue }
+            let b = o.boundingBox
+            // Convert Vision coordinate (0=bottom) to standard UI (0=top, 1=bottom)
+            let topDownY = 1.0 - (b.origin.y + b.size.height)
+            items.append(TextObservation(
+                text: candidate.string,
+                confidence: candidate.confidence,
+                x: Double(b.origin.x),
+                y: Double(topDownY),
+                width: Double(b.size.width),
+                height: Double(b.size.height)
+            ))
+        }
+    }
+    request.recognitionLevel = .accurate
+    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+    try? handler.perform([request])
+    
+    // Parse heuristics
+    var detectedPhase: String? = nil
+    var detectedElixir: Double? = nil
+    var towerNumbers: [Double] = []
+    
+    for item in items {
+        let upper = item.text.uppercased()
+        
+        // Match phase detection
+        if upper.contains("VICTORY") || upper.contains("VICTOIRE") ||
+           upper.contains("DEFEAT") || upper.contains("DÉFAITE") ||
+           upper.contains("CROWNS") || upper.contains("MATCH OVER") {
+            detectedPhase = "post-game"
+        } else if (upper.contains("OVERTIME") || upper.contains("SUDDEN DEATH")) && detectedPhase != "post-game" {
+            detectedPhase = "overtime"
+        } else if (upper.contains("BATTLE") || upper.contains("EVENTS") || upper.contains("SHOP")) && item.y > 0.85 {
+            detectedPhase = "menu"
+        }
+        
+        // Elixir detection (bottom 15% of screen, y > 0.85)
+        if item.y > 0.85 {
+            // Check if string is a number 0..10
+            let cleaned = item.text.trimmingCharacters(in: CharacterSet.decimalDigits.inverted)
+            if let val = Double(cleaned), val >= 0 && val <= 10 {
+                detectedElixir = val
+            }
+        }
+        
+        // Tower numbers (typically 3 or 4 digits: 500 to 5000)
+        let digitsOnly = item.text.trimmingCharacters(in: CharacterSet.decimalDigits.inverted)
+        if let num = Double(digitsOnly), num >= 500 && num <= 6000 {
+            towerNumbers.append(num)
+        }
+    }
+    
+    return OcrAnalysisResult(
+        rawTexts: items,
+        detectedElixir: detectedElixir,
+        detectedPhase: detectedPhase,
+        towerNumbers: towerNumbers
+    )
+}
+
 let args = CommandLine.arguments
 if args.count < 2 {
     print("Usage: helper <command> [args...]")
@@ -78,6 +164,7 @@ if args.count < 2 {
     print("  list-windows                     List all top-level application windows")
     print("  click <x> <y>                    Click at screen coordinates")
     print("  tap-sequence <x1> <y1> <x2> <y2> [delayMs] Click first then second location")
+    print("  ocr <imagePath>                  Run Apple Vision OCR on image")
     exit(1)
 }
 
@@ -123,6 +210,16 @@ case "tap-sequence":
     usleep(delayMs * 1000)
     clickAt(x: x2, y: y2)
     print("{\"success\": true}")
+
+case "ocr":
+    guard args.count >= 3 else {
+        fputs("Usage: helper ocr <imagePath>\n", stderr)
+        exit(1)
+    }
+    let result = analyzeImageOCR(imagePath: args[2])
+    if let data = try? encoder.encode(result), let json = String(data: data, encoding: .utf8) {
+        print(json)
+    }
 
 default:
     fputs("Unknown command: \(cmd)\n", stderr)

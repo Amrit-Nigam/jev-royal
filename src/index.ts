@@ -37,16 +37,25 @@ async function main() {
   const dryRun = args.includes('--dry-run');
   const singleTick = args.includes('--single-tick');
 
+  // CLI Flag: --deck "Card1,Card2,..."
+  const deckIndex = args.indexOf('--deck');
+  const deckArg = deckIndex !== -1 && args[deckIndex + 1] ? args[deckIndex + 1] : undefined;
+  const deckNames = deckArg ? deckArg.split(',').map((s) => s.trim()) : undefined;
+
   // Verify TypeSafe API key
   if (!process.env.TYPESAFE_API_KEY) {
     console.error('Error: TYPESAFE_API_KEY is not set in environment or .env file.');
     process.exit(1);
   }
 
+  const visionProvider = process.env.VISION_PROVIDER || (process.env.ANTHROPIC_API_KEY ? 'anthropic' : 'local');
+  console.log(`[config] Vision Perceiver: ${visionProvider === 'anthropic' ? 'Anthropic Claude' : 'Apple Vision (Local Native, 0 API keys)'}`);
+
   const loop = new GameLoop({
     windowQuery,
     dryRun,
     maxTicks: singleTick ? 1 : undefined,
+    deckNames,
   });
 
   await loop.run();
