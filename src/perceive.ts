@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { DeckTracker } from './deck.js';
-import type { GameState, MatchPhase, TroopUnit } from './types.js';
+import type { GameState, MatchPhase, TowerStatus, TroopUnit } from './types.js';
 
 const execFileAsync = promisify(execFile);
 const HELPER_PATH = resolve(process.cwd(), 'bin/helper');
@@ -18,11 +18,27 @@ interface OcrTextItem {
   height: number;
 }
 
+interface TowerNumber {
+  value: number;
+  x: number;
+  y: number;
+}
+
 interface OcrResult {
   rawTexts: OcrTextItem[];
   detectedElixir?: number | null;
   detectedPhase?: string | null;
-  towerNumbers: number[];
+  towerNumbers: TowerNumber[];
+}
+
+interface MotionCell {
+  side: 'own' | 'opponent';
+  lane: 'left' | 'center' | 'right';
+  intensity: number;
+}
+
+interface MotionResult {
+  cells: MotionCell[];
 }
 
 export interface PerceiveOptions {
@@ -31,6 +47,12 @@ export interface PerceiveOptions {
   openAiApiKey?: string;
   visionModel?: string;
   deckTracker?: DeckTracker;
+  /** Previous tick's captured frame, used for local motion-based threat detection. */
+  previousImagePath?: string;
+  /** Elixir actually observed on the previous tick, for hand-tracking confidence. */
+  previousElixir?: number;
+  /** Elixir cost of whatever was played last tick (if anything), for the same check. */
+  previousPlayCost?: number;
 }
 
 /**
@@ -39,7 +61,8 @@ export interface PerceiveOptions {
  */
 export async function perceiveGameStateLocally(
   imagePath: string,
-  deckTracker: DeckTracker
+  deckTracker: DeckTracker,
+  options: PerceiveOptions = {}
 ): Promise<GameState> {
   const { stdout } = await execFileAsync(HELPER_PATH, ['ocr', imagePath]);
   const ocrData: OcrResult = JSON.parse(stdout.trim());
@@ -62,20 +85,63 @@ export async function perceiveGameStateLocally(
 
   const nextCard = deckTracker.getNextCard();
 
-  // Detect potential threats in arena from OCR items in the middle battlefield
+  // Hand-tracking confidence: DeckTracker only *simulates* the FIFO rotation —
+  // it never actually reads the hand off the screen. If the elixir we just
+  // observed doesn't roughly match what spending last tick's card should have
+  // left us with, the simulated rotation has likely desynced from reality, and
+  // Jev should be told to treat cardsInHand as unreliable rather than act on it
+  // with false confidence.
+  let handTrackingConfidence: 'high' | 'low' = 'high';
+  if (options.previousElixir !== undefined && options.previousPlayCost !== undefined) {
+    const elapsedTicks = 1; // one loop tick between the two readings
+    const regenPerTick = (Number(process.env.TICK_INTERVAL_MS) || 2000) / 1000 / 2.8;
+    const expectedElixir = options.previousElixir - options.previousPlayCost + regenPerTick * elapsedTicks;
+    if (Math.abs(elixir - expectedElixir) > 2.5) {
+      handTrackingConfidence = 'low';
+    }
+  }
+
+  // Troop identity can't come from OCR (troops carry no readable text), so
+  // instead of guessing a name from nearby text, detect real frame-to-frame
+  // motion and report it as an unidentified threat/activity signal — true but
+  // vague beats a fabricated troop name.
   const opponentTroops: TroopUnit[] = [];
-  for (const item of ocrData.rawTexts) {
-    if (item.y > 0.35 && item.y < 0.70) {
-      const lane = item.x < 0.45 ? 'left' : item.x > 0.55 ? 'right' : 'center';
-      if (item.confidence > 0.7) {
-        opponentTroops.push({
-          type: item.text.replace(/[^a-zA-Z0-9 ]/g, '').trim() || 'Enemy Troop',
-          owner: 'opponent',
-          lane,
-          approxHpPercent: 80,
-          position: { xPercent: item.x, yPercent: item.y },
-        });
+  const ownTroops: TroopUnit[] = [];
+  if (options.previousImagePath) {
+    try {
+      const { stdout: motionOut } = await execFileAsync(HELPER_PATH, [
+        'motion',
+        options.previousImagePath,
+        imagePath,
+      ]);
+      const motion: MotionResult = JSON.parse(motionOut.trim());
+      for (const cell of motion.cells) {
+        const troop: TroopUnit = {
+          type: 'Unidentified activity',
+          owner: cell.side === 'opponent' ? 'opponent' : 'own',
+          lane: cell.lane,
+        };
+        (cell.side === 'opponent' ? opponentTroops : ownTroops).push(troop);
       }
+    } catch {
+      // Motion detection is best-effort; proceed without it if it fails.
+    }
+  }
+
+  // Tower HP: map each detected number to a tower by screen position instead
+  // of pretending every tower is always at 100%. Opponent towers are in the
+  // top half of the mirrored screen, our own in the bottom half; king towers
+  // sit in the center column, princess towers to either side.
+  const ownTowers: TowerStatus = {};
+  const opponentTowers: TowerStatus = {};
+  for (const num of ocrData.towerNumbers) {
+    const target = num.y < 0.5 ? opponentTowers : ownTowers;
+    if (num.x < 0.38) {
+      target.leftPrincessHpRaw = num.value;
+    } else if (num.x > 0.62) {
+      target.rightPrincessHpRaw = num.value;
+    } else {
+      target.kingHpRaw = num.value;
     }
   }
 
@@ -84,25 +150,12 @@ export async function perceiveGameStateLocally(
     elixir,
     cardsInHand: handCards,
     nextCard: nextCard.name,
-    opponentTroops: opponentTroops.slice(0, 3),
-    ownTroops: [],
-    ownTowers: {
-      leftPrincessHpPercent: 100,
-      rightPrincessHpPercent: 100,
-      kingHpPercent: 100,
-      leftPrincessStanding: true,
-      rightPrincessStanding: true,
-      kingStanding: true,
-    },
-    opponentTowers: {
-      leftPrincessHpPercent: 100,
-      rightPrincessHpPercent: 100,
-      kingHpPercent: 100,
-      leftPrincessStanding: true,
-      rightPrincessStanding: true,
-      kingStanding: true,
-    },
-    rawSummary: `Local Apple Vision perception: Phase=${phase}, Elixir=${elixir}, Threats=${opponentTroops.length}`,
+    opponentTroops: opponentTroops.slice(0, 6),
+    ownTroops: ownTroops.slice(0, 6),
+    ownTowers,
+    opponentTowers,
+    handTrackingConfidence,
+    rawSummary: `Local perception: Phase=${phase}, Elixir=${elixir}, OpponentActivity=${opponentTroops.length}, HandConfidence=${handTrackingConfidence}`,
   };
 }
 
@@ -256,7 +309,7 @@ export async function perceiveGameState(
       console.warn(
         `[perceive:openai] OpenAI vision call failed (${(err as Error).message}). Falling back to local Apple Vision.`
       );
-      return perceiveGameStateLocally(imagePath, tracker);
+      return perceiveGameStateLocally(imagePath, tracker, options);
     }
   }
 
@@ -269,10 +322,10 @@ export async function perceiveGameState(
       console.warn(
         `[perceive:anthropic] Anthropic vision call failed (${(err as Error).message}). Falling back to local Apple Vision.`
       );
-      return perceiveGameStateLocally(imagePath, tracker);
+      return perceiveGameStateLocally(imagePath, tracker, options);
     }
   }
 
   // 3. Default: Local on-device Apple Vision (Zero Keys Required!)
-  return perceiveGameStateLocally(imagePath, tracker);
+  return perceiveGameStateLocally(imagePath, tracker, options);
 }

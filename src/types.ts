@@ -35,6 +35,10 @@ export interface TowerStatus {
   leftPrincessStanding?: boolean;
   rightPrincessStanding?: boolean;
   kingStanding?: boolean;
+  /** Raw HP number read off the tower's health bar, when visible (no max-HP baseline, so not a percent). */
+  leftPrincessHpRaw?: number;
+  rightPrincessHpRaw?: number;
+  kingHpRaw?: number;
 }
 
 export type MatchPhase = 'pre-game' | 'in-progress' | 'overtime' | 'post-game' | 'menu';
@@ -50,6 +54,8 @@ export interface GameState {
   opponentTowers: TowerStatus;
   timeRemainingSeconds?: number;
   rawSummary?: string;
+  /** Whether cardsInHand can be trusted this tick (see DeckTracker desync check). */
+  handTrackingConfidence?: 'high' | 'low';
 }
 
 export type PlacementLane =

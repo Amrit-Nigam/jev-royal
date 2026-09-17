@@ -98,8 +98,13 @@ export async function decideMove(
           timeRemainingSeconds: gameState.timeRemainingSeconds ?? null,
           situationSummary: gameState.rawSummary || '',
           bestKnownCounter: bestKnownCounter ?? null,
+          handTrackingConfidence: gameState.handTrackingConfidence ?? 'high',
           strategyPolicy: [
-            'Defend before you push: if an opponent troop is on our side of the river, prioritize a positive-elixir-trade defensive answer over starting a new offensive push.',
+            gameState.handTrackingConfidence === 'low'
+              ? 'handTrackingConfidence is LOW this tick: the reported cardsInHand may not match what is really on screen (a rotation-tracking desync was detected from the elixir trend). Prefer holding elixir or only playing a card you are still fairly confident about, rather than committing to an aggressive plan built on cardsInHand.'
+              : 'handTrackingConfidence is high: cardsInHand can be trusted normally.',
+            'Opponent/own troops of type "Unidentified activity" mean real on-screen motion was detected in that lane but the exact unit could not be identified (no card art recognition) — treat it as "something is happening there", not a specific known matchup. Do not assume it matches any specific countersWell/vulnerableTo entry unless bestKnownCounter says so.',
+            'Defend before you push: if opponent activity is reported on our side of the river, prioritize a positive-elixir-trade defensive answer over starting a new offensive push.',
             'A card is a good defensive answer when its role/targeting beats the threat cheaply (see each card\'s countersWell / vulnerableTo and the opponent troop\'s knownRole) — prefer that over a generic tanky unit.',
             'Do not place swarm cards (role swarm/spirit) directly on top of a threat that has splash damage (e.g. wizard, valkyrie, bomber, baby dragon) — they will trade badly.',
             'Air troops (targets air, e.g. minions, bats, balloon, lava hound) can only be answered by cards that target air or both — a ground-only melee card will not reach them.',

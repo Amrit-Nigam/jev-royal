@@ -22,6 +22,9 @@ export class GameLoop {
   private tickCount = 0;
   private readonly options: LoopOptions;
   private deckTracker: DeckTracker;
+  private previousFramePath?: string;
+  private previousElixir?: number;
+  private previousPlayCost?: number;
 
   constructor(options: LoopOptions = {}) {
     this.options = {
@@ -56,6 +59,8 @@ export class GameLoop {
     // 1. Capture window screenshot
     const { filePath, base64 } = await captureWindow(windowInfo.id);
     console.log(`[capture] Captured window frame: ${filePath}`);
+    const priorFramePath = this.previousFramePath;
+    this.previousFramePath = filePath;
 
     // 2. Perceive board state
     console.log('[perceive] Analyzing frame with vision...');
@@ -63,13 +68,17 @@ export class GameLoop {
     try {
       gameState = await perceiveGameState(filePath, base64, {
         deckTracker: this.deckTracker,
+        previousImagePath: priorFramePath,
+        previousElixir: this.previousElixir,
+        previousPlayCost: this.previousPlayCost,
       });
+      this.previousElixir = gameState.elixir;
       console.log(
-        `[perceive] Phase: ${gameState.matchPhase.toUpperCase()} | Elixir: ${gameState.elixir.toFixed(1)} | Hand: [${gameState.cardsInHand.map((c) => c.name).join(', ')}]`
+        `[perceive] Phase: ${gameState.matchPhase.toUpperCase()} | Elixir: ${gameState.elixir.toFixed(1)} | Hand: [${gameState.cardsInHand.map((c) => c.name).join(', ')}]${gameState.handTrackingConfidence === 'low' ? ' (LOW CONFIDENCE - possible desync)' : ''}`
       );
       if (gameState.opponentTroops.length > 0) {
         console.log(
-          `[perceive] Opponent threats: ${gameState.opponentTroops.map((t) => `${t.type} (${t.lane})`).join(', ')}`
+          `[perceive] Opponent activity: ${gameState.opponentTroops.map((t) => `${t.type} (${t.lane})`).join(', ')}`
         );
       }
     } catch (err) {
@@ -121,6 +130,7 @@ export class GameLoop {
 
     // 4. Act (simulate clicks)
     let actionTaken;
+    this.previousPlayCost = 0;
     if (decision.shouldPlayNow && decision.whichCard !== 'none') {
       const coords = await executePlay(windowInfo.bounds, decision, {
         dryRun: this.options.dryRun,
@@ -130,6 +140,7 @@ export class GameLoop {
         const slotMatch = decision.whichCard.match(/\d+/);
         const slotNum = slotMatch ? parseInt(slotMatch[0], 10) : 1;
         const cardObj = gameState.cardsInHand.find((c) => c.slot === slotNum);
+        this.previousPlayCost = cardObj?.elixirCost ?? 0;
 
         // Rotate deck cycle
         const rotatedCard = this.deckTracker.playSlot(slotNum);

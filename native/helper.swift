@@ -26,11 +26,27 @@ struct TextObservation: Codable {
     let height: Double
 }
 
+struct TowerNumber: Codable {
+    let value: Double
+    let x: Double
+    let y: Double
+}
+
 struct OcrAnalysisResult: Codable {
     let rawTexts: [TextObservation]
     let detectedElixir: Double?
     let detectedPhase: String?
-    let towerNumbers: [Double]
+    let towerNumbers: [TowerNumber]
+}
+
+struct MotionCell: Codable {
+    let side: String // "own" or "opponent"
+    let lane: String // "left", "center", "right"
+    let intensity: Double // 0-255 average pixel delta
+}
+
+struct MotionResult: Codable {
+    let cells: [MotionCell]
 }
 
 func listAllWindows() -> [WindowInfo] {
@@ -142,7 +158,7 @@ func analyzeImageOCR(imagePath: String) -> OcrAnalysisResult {
     // Parse heuristics
     var detectedPhase: String? = nil
     var detectedElixir: Double? = nil
-    var towerNumbers: [Double] = []
+    var towerNumbers: [TowerNumber] = []
     
     for item in items {
         let upper = item.text.uppercased()
@@ -168,10 +184,10 @@ func analyzeImageOCR(imagePath: String) -> OcrAnalysisResult {
             }
         }
         
-        // Tower numbers (typically 3 or 4 digits: 500 to 5000)
+        // Tower numbers (typically 3 or 4 digits: 500 to 6000)
         let digitsOnly = item.text.trimmingCharacters(in: CharacterSet.decimalDigits.inverted)
         if let num = Double(digitsOnly), num >= 500 && num <= 6000 {
-            towerNumbers.append(num)
+            towerNumbers.append(TowerNumber(value: num, x: item.x, y: item.y))
         }
     }
     
@@ -188,6 +204,94 @@ func analyzeImageOCR(imagePath: String) -> OcrAnalysisResult {
     )
 }
 
+// Raw RGBA pixel buffer loader, used for frame-to-frame motion detection since
+// OCR text cannot identify troop sprites (troops don't carry readable text).
+func loadPixels(_ path: String) -> (width: Int, height: Int, data: [UInt8])? {
+    guard let image = NSImage(contentsOfFile: path),
+          let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return nil
+    }
+    let width = cgImage.width
+    let height = cgImage.height
+    var data = [UInt8](repeating: 0, count: width * height * 4)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    guard let context = CGContext(
+        data: &data,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+        return nil
+    }
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return (width, height, data)
+}
+
+/// Detects motion between two consecutive frames of the same window, bucketed
+/// into a 3x2 lane/side grid over the battle arena band (excludes the top
+/// status bar and bottom hand UI, which change every frame regardless of
+/// troop movement). Reports intensity per cell rather than guessing troop
+/// identity — Jev is told "something is happening here", not a fabricated name.
+func detectMotion(prevPath: String, currPath: String) -> MotionResult {
+    guard let prev = loadPixels(prevPath), let curr = loadPixels(currPath),
+          prev.width == curr.width, prev.height == curr.height else {
+        return MotionResult(cells: [])
+    }
+
+    let width = prev.width
+    let height = prev.height
+    let arenaTop = 0.15  // below opponent status bar
+    let arenaBottom = 0.85 // above own hand cards
+    let colBounds = [0.0, 0.38, 0.62, 1.0] // left / center / right
+    let rowMid = 0.5 // own half vs opponent half
+
+    var sums = [[Double]](repeating: [Double](repeating: 0, count: 3), count: 2)
+    var counts = [[Int]](repeating: [Int](repeating: 0, count: 3), count: 2)
+
+    let stride = 3 // sample every 3rd pixel per axis to keep this fast
+    var y = 0
+    while y < height {
+        let yPercent = Double(y) / Double(height)
+        if yPercent >= arenaTop && yPercent <= arenaBottom {
+            let rowIdx = yPercent < rowMid ? 0 : 1 // 0 = opponent (top), 1 = own (bottom)
+            var x = 0
+            while x < width {
+                let xPercent = Double(x) / Double(width)
+                var colIdx = 1
+                if xPercent < colBounds[1] { colIdx = 0 } else if xPercent >= colBounds[2] { colIdx = 2 }
+
+                let idx = (y * width + x) * 4
+                let dr = abs(Int(curr.data[idx]) - Int(prev.data[idx]))
+                let dg = abs(Int(curr.data[idx + 1]) - Int(prev.data[idx + 1]))
+                let db = abs(Int(curr.data[idx + 2]) - Int(prev.data[idx + 2]))
+                sums[rowIdx][colIdx] += Double(dr + dg + db) / 3.0
+                counts[rowIdx][colIdx] += 1
+
+                x += stride
+            }
+        }
+        y += stride
+    }
+
+    let sides = ["opponent", "own"]
+    let lanes = ["left", "center", "right"]
+    var cells: [MotionCell] = []
+    let threshold = 14.0 // filters sensor/compression noise from real movement
+    for r in 0..<2 {
+        for c in 0..<3 {
+            guard counts[r][c] > 0 else { continue }
+            let avg = sums[r][c] / Double(counts[r][c])
+            if avg > threshold {
+                cells.append(MotionCell(side: sides[r], lane: lanes[c], intensity: avg))
+            }
+        }
+    }
+    return MotionResult(cells: cells)
+}
+
 let args = CommandLine.arguments
 if args.count < 2 {
     print("Usage: helper <command> [args...]")
@@ -197,6 +301,7 @@ if args.count < 2 {
     print("  click <x> <y>                    Click at screen coordinates")
     print("  tap-sequence <x1> <y1> <x2> <y2> [delayMs] Click first then second location")
     print("  ocr <imagePath>                  Run Apple Vision OCR on image")
+    print("  motion <prevImagePath> <currImagePath>  Detect lane/side motion between two frames")
     exit(1)
 }
 
@@ -251,6 +356,16 @@ case "ocr":
         exit(1)
     }
     let result = analyzeImageOCR(imagePath: args[2])
+    if let data = try? encoder.encode(result), let json = String(data: data, encoding: .utf8) {
+        print(json)
+    }
+
+case "motion":
+    guard args.count >= 4 else {
+        fputs("Usage: helper motion <prevImagePath> <currImagePath>\n", stderr)
+        exit(1)
+    }
+    let result = detectMotion(prevPath: args[2], currPath: args[3])
     if let data = try? encoder.encode(result), let json = String(data: data, encoding: .utf8) {
         print(json)
     }
