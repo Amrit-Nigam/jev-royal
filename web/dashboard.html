@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jev Agent</title>
+<style>
+  /* shadcn/ui dark (zinc) tokens */
+  :root {
+    --background: #09090b;
+    --card: #0c0c0f;
+    --muted: #18181b;
+    --border: #27272a;
+    --input: #27272a;
+    --foreground: #fafafa;
+    --muted-foreground: #a1a1aa;
+    --destructive: #ef4444;
+    --success: #22c55e;
+    --warning: #eab308;
+    --info: #3b82f6;
+    --elixir: #d946ef;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-font-smoothing: antialiased; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--background);
+    color: var(--foreground);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+    letter-spacing: -0.006em;
+  }
+  .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+
+  /* header */
+  header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+  .brand { font-size: 14px; font-weight: 600; letter-spacing: -0.02em; margin-right: 4px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 22px; padding: 0 9px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--muted);
+    font-size: 12px; font-weight: 500; color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .badge.live { color: var(--success); border-color: #14532d; background: #052e16; }
+  .badge.wait { color: var(--warning); border-color: #422006; background: #1c1207; }
+  .badge.dead { color: var(--destructive); border-color: #450a0a; background: #1f0a0a; }
+  .badge.accent { color: var(--elixir); border-color: #4a1d4f; background: #1b0a1d; }
+  .spacer { flex: 1; }
+
+  /* layout */
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .stack { display: grid; gap: 16px; }
+
+  /* card */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .card-header { padding: 14px 16px 0; }
+  .card-title { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
+  .card-desc { font-size: 12px; color: var(--muted-foreground); margin: 2px 0 0; }
+  .card-content { padding: 14px 16px; }
+
+  .muted { color: var(--muted-foreground); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+  /* elixir */
+  .elixir-row { display: flex; align-items: baseline; gap: 8px; }
+  .elixir-val { font-size: 28px; font-weight: 600; letter-spacing: -0.03em; line-height: 1; }
+  .progress { height: 6px; background: var(--muted); border-radius: 999px; overflow: hidden; margin-top: 12px; }
+  .progress > i { display: block; height: 100%; background: var(--elixir); border-radius: 999px; transition: width .15s linear; }
+
+  /* hand */
+  .hand { display: grid; gap: 8px; }
+  .slot {
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--background); padding: 9px 10px;
+    transition: opacity .15s;
+  }
+  .slot.off { opacity: .4; }
+  .slot-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .slot-name { font-size: 13px; font-weight: 500; }
+  .slot-idx { color: var(--muted-foreground); font-weight: 400; margin-right: 6px; }
+  .cost {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 20px; height: 20px; padding: 0 5px; border-radius: 5px;
+    background: #1b0a1d; border: 1px solid #4a1d4f; color: var(--elixir);
+    font-size: 11px; font-weight: 600;
+  }
+  .conf { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11px; color: var(--muted-foreground); }
+  .conf .progress { flex: 1; margin: 0; height: 4px; }
+  .conf .progress > i { background: var(--success); }
+  .conf.weak .progress > i { background: var(--warning); }
+
+  /* decision */
+  .src {
+    display: inline-flex; align-items: center; height: 22px; padding: 0 9px;
+    border-radius: 6px; font-size: 11px; font-weight: 600; letter-spacing: .01em;
+    border: 1px solid var(--border); background: var(--muted); color: var(--muted-foreground);
+  }
+  .src.urgent { color: var(--destructive); border-color: #450a0a; background: #1f0a0a; }
+  .src.jev { color: var(--info); border-color: #172554; background: #0a1020; }
+  .src.local { color: var(--warning); border-color: #422006; background: #1c1207; }
+  .explain { margin-top: 12px; font-size: 13px; line-height: 1.6; }
+
+  /* table */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th {
+    text-align: left; font-size: 11px; font-weight: 500; color: var(--muted-foreground);
+    padding: 0 10px 8px; border-bottom: 1px solid var(--border);
+  }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr.chosen { background: #0f1729; }
+  tbody tr.chosen td:first-child { box-shadow: inset 2px 0 0 var(--info); }
+
+  /* metrics */
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--border); border-radius: 6px; overflow: hidden; }
+  .metric { background: var(--card); padding: 10px 8px; text-align: center; }
+  .metric b { display: block; font-size: 16px; font-weight: 600; letter-spacing: -0.02em; }
+  .metric span { font-size: 11px; color: var(--muted-foreground); }
+
+  .empty { color: var(--muted-foreground); font-size: 12px; padding: 4px 0; }
+  .legend { display: flex; gap: 14px; margin-top: 10px; font-size: 11px; color: var(--muted-foreground); }
+  .legend i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="brand">Jev</span>
+  <span class="badge" id="status"><i class="dot"></i><span id="status-text">connecting</span></span>
+  <span class="badge mono" id="tick">—</span>
+  <span class="badge mono" id="clock">—:—</span>
+  <span class="badge accent" id="x2" hidden>2× elixir</span>
+</header>
+
+<div class="grid">
+  <!-- LEFT -->
+  <div class="stack">
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Arena</h2>
+        <p class="card-desc">Live unit positions and chosen placement</p>
+      </div>
+      <div class="card-content">
+        <svg id="arena" viewBox="0 0 180 320" width="100%"
+             style="display:block;border-radius:6px;background:#0f0f12;border:1px solid var(--border)">
+          <rect x="0" y="0" width="180" height="320" fill="#0f0f12"/>
+          <rect id="half-opp" x="0" y="0" width="180" height="160" fill="#131317"/>
+          <rect id="river" x="0" width="180" height="10" fill="#1e3a5f" opacity=".7"/>
+          <g id="bridges"></g>
+          <g id="towers"></g>
+          <g id="units"></g>
+          <g id="target"></g>
+        </svg>
+        <div class="legend">
+          <span><i style="background:#ef4444"></i>enemy</span>
+          <span><i style="background:#3b82f6"></i>ours</span>
+          <span><i style="background:#eab308"></i>placement</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Elixir</h2></div>
+      <div class="card-content">
+        <div class="elixir-row">
+          <span class="elixir-val mono" id="elixir">—</span>
+          <span class="muted mono" style="font-size:12px" id="elixir-note"></span>
+        </div>
+        <div class="progress"><i id="elixir-bar" style="width:0%"></i></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Latency</h2>
+        <p class="card-desc">Milliseconds per stage</p>
+      </div>
+      <div class="card-content">
+        <div class="metrics">
+          <div class="metric"><b class="mono" id="t-cap">—</b><span>capture</span></div>
+          <div class="metric"><b class="mono" id="t-per">—</b><span>perceive</span></div>
+          <div class="metric"><b class="mono" id="t-dec">—</b><span>decide</span></div>
+          <div class="metric"><b class="mono" id="t-tot">—</b><span>total</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT -->
+  <div class="stack">
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Hand</h2>
+        <p class="card-desc">Card identity read from the screen, with match confidence</p>
+      </div>
+      <div class="card-content"><div class="hand" id="hand"><div class="empty">Waiting for a match</div></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Decision</h2></div>
+      <div class="card-content">
+        <div class="row">
+          <span class="src" id="src">—</span>
+          <span class="muted mono" style="font-size:12px" id="probs"></span>
+        </div>
+        <div class="explain" id="explain">—</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Options considered</h2>
+        <p class="card-desc">Every candidate play, best first</p>
+      </div>
+      <div class="card-content" style="padding-left:6px;padding-right:6px">
+        <table>
+          <thead><tr><th>Score</th><th>Kind</th><th>Card</th><th>Placement</th></tr></thead>
+          <tbody id="cands"><tr><td colspan="4" class="empty">None</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Towers</h2></div>
+      <div class="card-content" style="padding-left:6px;padding-right:6px">
+        <table>
+          <thead><tr><th>Side</th><th>Tower</th><th>HP</th><th>State</th></tr></thead>
+          <tbody id="towers-t"><tr><td colspan="4" class="empty">Unknown</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Arena geometry, mirroring src/arena.ts. Positions arrive as fractions of the
+// mirroring window, so they are remapped into the SVG's tile-shaped viewBox.
+const A = {
+  leftLaneX: 0.23, rightLaneX: 0.77, centerX: 0.505,
+  riverY: 0.47, ownPrincessY: 0.655, ownKingY: 0.785,
+  oppPrincessY: 0.255, oppKingY: 0.155,
+};
+const X0 = 0.03, XS = 0.94, Y0 = 0.13, YS = 0.68;
+const sx = x => (x - X0) / XS * 180;
+const sy = y => (y - Y0) / YS * 320;
+
+const $ = id => document.getElementById(id);
+const svgEl = (n, attrs) => {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', n);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+};
+
+(function drawStatic() {
+  $('half-opp').setAttribute('height', sy(A.riverY));
+  $('river').setAttribute('y', sy(A.riverY) - 5);
+  const bridges = $('bridges');
+  for (const x of [A.leftLaneX, A.rightLaneX]) {
+    bridges.appendChild(svgEl('rect', {
+      x: sx(x) - 9, y: sy(A.riverY) - 6, width: 18, height: 12,
+      fill: '#3f3f46', rx: 2,
+    }));
+  }
+})();
+
+const TOWERS = [
+  { side: 'opponent', position: 'left',  x: A.leftLaneX,  y: A.oppPrincessY },
+  { side: 'opponent', position: 'right', x: A.rightLaneX, y: A.oppPrincessY },
+  { side: 'opponent', position: 'king',  x: A.centerX,    y: A.oppKingY },
+  { side: 'own',      position: 'left',  x: A.leftLaneX,  y: A.ownPrincessY },
+  { side: 'own',      position: 'right', x: A.rightLaneX, y: A.ownPrincessY },
+  { side: 'own',      position: 'king',  x: A.centerX,    y: A.ownKingY },
+];
+
+function drawTowers(towers) {
+  const g = $('towers');
+  g.textContent = '';
+  for (const spot of TOWERS) {
+    const state = (towers || []).find(t => t.side === spot.side && t.position === spot.position);
+    const down = state && state.standing === false;
+    const size = spot.position === 'king' ? 16 : 13;
+    g.appendChild(svgEl('rect', {
+      x: sx(spot.x) - size / 2, y: sy(spot.y) - size / 2,
+      width: size, height: size, rx: 3,
+      fill: down ? '#18181b' : (spot.side === 'own' ? '#1e3a8a' : '#7f1d1d'),
+      stroke: down ? '#27272a' : (spot.side === 'own' ? '#3b82f6' : '#ef4444'),
+      'stroke-width': 1,
+      opacity: down ? .5 : 1,
+    }));
+  }
+}
+
+function drawUnits(threats, own) {
+  const g = $('units');
+  g.textContent = '';
+  for (const u of own || []) {
+    g.appendChild(svgEl('circle', { cx: sx(u.x), cy: sy(u.y), r: 4, fill: '#3b82f6', opacity: .9 }));
+  }
+  for (const u of threats || []) {
+    g.appendChild(svgEl('circle', { cx: sx(u.x), cy: sy(u.y), r: 4.5, fill: '#ef4444' }));
+    // Heading of a tracked unit, which is what spell aiming leads.
+    if (u.velocity) {
+      g.appendChild(svgEl('line', {
+        x1: sx(u.x), y1: sy(u.y),
+        x2: sx(u.x + u.velocity.x), y2: sy(u.y + u.velocity.y),
+        stroke: '#ef4444', 'stroke-width': 1.2, opacity: .5,
+      }));
+    }
+  }
+}
+
+function drawTarget(placement) {
+  const g = $('target');
+  g.textContent = '';
+  if (!placement) return;
+  const x = sx(placement.x), y = sy(placement.y);
+  g.appendChild(svgEl('circle', {
+    cx: x, cy: y, r: 10, fill: 'none', stroke: '#eab308', 'stroke-width': 1.2,
+    'stroke-dasharray': '3 3', opacity: .8,
+  }));
+  for (const [dx, dy] of [[5, 0], [0, 5]]) {
+    g.appendChild(svgEl('line', {
+      x1: x - dx, y1: y - dy, x2: x + dx, y2: y + dy,
+      stroke: '#eab308', 'stroke-width': 1.6, 'stroke-linecap': 'round',
+    }));
+  }
+}
+
+const fmtClock = s =>
+  (s === undefined || s === null) ? '—:—' : Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+
+function render(tick) {
+  const g = tick.gameState || {};
+  const phase = g.matchPhase || 'unknown';
+  const inBattle = phase === 'in-progress' || phase === 'overtime';
+
+  $('status').className = 'badge ' + (tick.error ? 'dead' : inBattle ? 'live' : 'wait');
+  $('status-text').textContent = tick.error ? 'error' : (tick.skippedReason || phase);
+  $('tick').textContent = 'tick ' + (tick.tickNumber ?? '—');
+  $('clock').textContent = fmtClock(g.timeRemainingSeconds);
+  $('x2').hidden = !g.doubleElixir;
+
+  const e = typeof g.elixir === 'number' ? g.elixir : 0;
+  $('elixir').textContent = inBattle ? e.toFixed(2) : '—';
+  $('elixir-bar').style.width = (e / 10 * 100) + '%';
+  $('elixir-note').textContent = e >= 9.4 ? 'at cap, leaking' : '';
+
+  const hand = $('hand');
+  if (!g.cardsInHand || !g.cardsInHand.length) {
+    hand.innerHTML = '<div class="empty">Waiting for a match</div>';
+  } else {
+    hand.innerHTML = g.cardsInHand.map(c => {
+      const r = c.recognition || { score: 0, margin: 0, confident: false };
+      const pct = Math.max(0, Math.min(100, r.score * 100));
+      return `<div class="slot${c.isPlayable ? '' : ' off'}">
+        <div class="slot-top">
+          <span class="slot-name"><span class="slot-idx mono">${c.slot}</span>${c.name}</span>
+          <span class="cost mono">${c.elixirCost}</span>
+        </div>
+        <div class="conf ${r.confident ? '' : 'weak'}">
+          <span>${r.confident ? 'matched' : 'weak match'}</span>
+          <span class="progress"><i style="width:${pct}%"></i></span>
+          <span class="mono">${r.score.toFixed(2)} +${r.margin.toFixed(2)}</span>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  const d = tick.decision;
+  const src = $('src');
+  if (d) {
+    const map = {
+      'tactics-urgent': ['urgent', 'Urgent · local'],
+      'jev': ['jev', 'Jev'],
+      'tactics-fallback': ['local', 'Local tactics'],
+      'hold': ['', 'Hold'],
+    };
+    const [cls, label] = map[d.source] || ['', d.source];
+    src.className = 'src ' + cls;
+    src.textContent = label;
+    $('probs').textContent = `p(play) ${d.shouldPlayProbability.toFixed(2)} · conf ${d.confidence.toFixed(2)}`;
+    $('explain').textContent = d.explanation || '—';
+  } else {
+    src.className = 'src';
+    src.textContent = '—';
+    $('probs').textContent = '';
+    $('explain').textContent = tick.skippedReason || 'No decision this tick';
+  }
+
+  const cands = (d && d.candidates) || [];
+  const chosenId = d && d.action ? d.action.id : null;
+  $('cands').innerHTML = cands.length
+    ? cands.map(c => `<tr class="${c.id === chosenId ? 'chosen' : ''}">
+        <td class="mono">${c.score.toFixed(0)}</td>
+        <td class="muted">${c.kind}</td>
+        <td>${c.card.name}</td>
+        <td class="muted">${c.placement.label}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="4" class="empty">None</td></tr>';
+
+  const towers = g.towers || [];
+  $('towers-t').innerHTML = towers.length
+    ? towers.map(t => `<tr>
+        <td class="muted">${t.side}</td><td>${t.position}</td>
+        <td class="mono">${t.hp ?? '—'}</td>
+        <td style="color:${t.standing ? 'var(--success)' : 'var(--destructive)'}">${t.standing ? 'standing' : 'destroyed'}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="4" class="empty">Unknown</td></tr>';
+
+  const t = tick.timings;
+  $('t-cap').textContent = t ? t.captureMs : '—';
+  $('t-per').textContent = t ? t.perceiveMs : '—';
+  $('t-dec').textContent = t ? t.decideMs : '—';
+  $('t-tot').textContent = t ? t.totalMs : '—';
+
+  drawTowers(towers);
+  drawUnits(g.threats, g.ownUnits);
+  drawTarget(d && d.action ? d.action.placement : null);
+}
+
+const es = new EventSource('/events');
+es.onmessage = ev => {
+  try { render(JSON.parse(ev.data)); } catch (err) { console.error(err); }
+};
+es.onerror = () => {
+  $('status').className = 'badge dead';
+  $('status-text').textContent = 'agent offline';
+};
+</script>
+</body>
+</html>

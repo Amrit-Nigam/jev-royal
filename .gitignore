@@ -4,3 +4,8 @@ dist/
 captures/
 bin/helper
 .DS_Store
+
+# Card art is ~9MB and reproducible via tools/fetch_card_assets.sh.
+# The derived index (assets/card-index.json) is committed instead.
+assets/cards/
+recordings/

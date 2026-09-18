@@ -1,331 +1,433 @@
 import { execFile } from 'node:child_process';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
-import { DeckTracker } from './deck.js';
-import type { GameState, MatchPhase, TowerStatus, TroopUnit } from './types.js';
+import { ARENA, isOnOurSide } from './arena.js';
+import { getCardKnowledge } from './cards.js';
+import type { ArenaUnit, CardInHand, CardType, GameState, MatchPhase, TowerState } from './types.js';
 
 const execFileAsync = promisify(execFile);
 const HELPER_PATH = resolve(process.cwd(), 'bin/helper');
 
-interface OcrTextItem {
-  text: string;
-  confidence: number;
+/**
+ * A card match is only trusted when it both scores well and clearly beats the
+ * runner-up. These thresholds come from measuring the matcher against real
+ * capture frames: genuine in-battle matches land around 0.5-0.7 with a margin
+ * well above 0.05, while non-battle frames top out near 0.5 with margins under
+ * 0.05. Requiring both keeps menu screens from being read as a hand.
+ */
+const CARD_MIN_SCORE = 0.42;
+const CARD_MIN_MARGIN = 0.05;
+
+interface HelperCardCandidate {
+  key: string;
+  name: string;
+  elixir: number;
+  type: string;
+  score: number;
+}
+
+interface HelperCardMatch {
+  slot: number;
+  key: string;
+  name: string;
+  elixir: number;
+  type: string;
+  score: number;
+  margin: number;
+  alternatives: HelperCardCandidate[];
+}
+
+interface HelperHealthBar {
+  owner: 'own' | 'opponent';
   x: number;
   y: number;
   width: number;
-  height: number;
 }
 
-interface TowerNumber {
+interface HelperMotionCell {
+  x: number;
+  y: number;
+  intensity: number;
+}
+
+interface HelperTowerNumber {
   value: number;
   x: number;
   y: number;
 }
 
-interface OcrResult {
-  rawTexts: OcrTextItem[];
-  detectedElixir?: number | null;
-  detectedPhase?: string | null;
-  towerNumbers: TowerNumber[];
+interface HelperState {
+  inBattle: boolean;
+  elixir?: number;
+  doubleElixir: boolean;
+  cards: HelperCardMatch[];
+  nextCard?: HelperCardMatch;
+  healthBars: HelperHealthBar[];
+  motion: HelperMotionCell[];
+  towerNumbers: HelperTowerNumber[];
+  detectedPhase?: string;
+  timeRemainingSeconds?: number;
 }
 
-interface MotionCell {
-  side: 'own' | 'opponent';
-  lane: 'left' | 'center' | 'right';
-  intensity: number;
-}
-
-interface MotionResult {
-  cells: MotionCell[];
-}
+/** The six tower positions, used to ignore tower health bars when finding units. */
+const TOWER_ANCHORS: Array<{ side: 'own' | 'opponent'; position: 'left' | 'right' | 'king'; x: number; y: number }> = [
+  { side: 'opponent', position: 'left', x: ARENA.leftLaneX, y: ARENA.opponentPrincessY },
+  { side: 'opponent', position: 'right', x: ARENA.rightLaneX, y: ARENA.opponentPrincessY },
+  { side: 'opponent', position: 'king', x: ARENA.centerX, y: ARENA.opponentKingY },
+  { side: 'own', position: 'left', x: ARENA.leftLaneX, y: ARENA.ownPrincessY },
+  { side: 'own', position: 'right', x: ARENA.rightLaneX, y: ARENA.ownPrincessY },
+  { side: 'own', position: 'king', x: ARENA.centerX, y: ARENA.ownKingY },
+];
 
 export interface PerceiveOptions {
-  provider?: 'local' | 'anthropic' | 'openai';
-  anthropicApiKey?: string;
-  openAiApiKey?: string;
-  visionModel?: string;
-  deckTracker?: DeckTracker;
-  /** Previous tick's captured frame, used for local motion-based threat detection. */
+  /** Previous frame, enabling motion detection. */
   previousImagePath?: string;
-  /** Elixir actually observed on the previous tick, for hand-tracking confidence. */
-  previousElixir?: number;
-  /** Elixir cost of whatever was played last tick (if anything), for the same check. */
-  previousPlayCost?: number;
+  /** Run the (slower) OCR pass on this frame. */
+  runOcr?: boolean;
 }
 
 /**
- * Local Native Vision Perceiver using macOS built-in Apple Vision framework.
- * Requires ZERO external API keys. Runs 100% on-device.
+ * Perceives game state from captured frames.
+ *
+ * Holds state across ticks because several signals are only meaningful over
+ * time: which health bars are scenery rather than units, what the clock read at
+ * the last OCR pass, and each tower's last known hit points.
  */
-export async function perceiveGameStateLocally(
-  imagePath: string,
-  deckTracker: DeckTracker,
-  options: PerceiveOptions = {}
-): Promise<GameState> {
-  const { stdout } = await execFileAsync(HELPER_PATH, ['ocr', imagePath]);
-  const ocrData: OcrResult = JSON.parse(stdout.trim());
+export class Perceiver {
+  /** How often a health bar has appeared at each quantized position. */
+  private barSightings = new Map<string, number>();
+  private framesSeen = 0;
 
-  let phase: MatchPhase = 'in-progress';
-  if (ocrData.detectedPhase) {
-    phase = ocrData.detectedPhase as MatchPhase;
-  }
+  private lastClockSeconds?: number;
+  private lastClockAt?: number;
+  private towerHp = new Map<string, number>();
+  private towerSeen = new Map<string, number>();
+  private ocrPasses = 0;
 
-  // Determine elixir (defaults to 6.0 if not directly OCR'd)
-  const elixir = ocrData.detectedElixir ?? 6.0;
+  /** Cards latched per slot, so a card we cannot afford stays identified.
+   *
+   * Clash Royale renders unaffordable cards desaturated, which measurably
+   * degrades template matching. A card in a slot cannot change until it is
+   * played, so a confident reading is kept until the art actually changes.
+   */
+  private slotLatch = new Map<number, { key: string; name: string; elixir: number; type: CardType }>();
 
-  // Read cards in hand from deck cycle tracker
-  const handCards = deckTracker.getHand().map((card, idx) => ({
-    slot: (idx + 1) as 1 | 2 | 3 | 4,
-    name: card.name,
-    elixirCost: card.elixirCost,
-    isPlayable: elixir >= card.elixirCost,
-  }));
+  /** Cards confidently recognized so far, which converges on the deck in play. */
+  private deckSeen = new Map<string, number>();
 
-  const nextCard = deckTracker.getNextCard();
+  /** Previous frame's units, for measuring velocity. */
+  private lastUnits?: ArenaUnit[];
+  private lastUnitsAt?: number;
 
-  // Hand-tracking confidence: DeckTracker only *simulates* the FIFO rotation —
-  // it never actually reads the hand off the screen. If the elixir we just
-  // observed doesn't roughly match what spending last tick's card should have
-  // left us with, the simulated rotation has likely desynced from reality, and
-  // Jev should be told to treat cardsInHand as unreliable rather than act on it
-  // with false confidence.
-  let handTrackingConfidence: 'high' | 'low' = 'high';
-  if (options.previousElixir !== undefined && options.previousPlayCost !== undefined) {
-    const elapsedTicks = 1; // one loop tick between the two readings
-    const regenPerTick = (Number(process.env.TICK_INTERVAL_MS) || 2000) / 1000 / 2.8;
-    const expectedElixir = options.previousElixir - options.previousPlayCost + regenPerTick * elapsedTicks;
-    if (Math.abs(elixir - expectedElixir) > 2.5) {
-      handTrackingConfidence = 'low';
+  public async perceive(imagePath: string, options: PerceiveOptions = {}): Promise<GameState> {
+    const args = ['state', imagePath];
+    if (options.previousImagePath) args.push(options.previousImagePath);
+    if (options.runOcr) args.push('--ocr');
+
+    const { stdout } = await execFileAsync(HELPER_PATH, args, { maxBuffer: 16 * 1024 * 1024 });
+    const raw = JSON.parse(stdout.trim()) as HelperState;
+
+    this.framesSeen++;
+    if (options.runOcr) this.ocrPasses++;
+
+    const elixir = raw.elixir ?? 0;
+    const phase = this.resolvePhase(raw);
+
+    if (!raw.inBattle) {
+      return {
+        matchPhase: phase,
+        elixir: 0,
+        doubleElixir: false,
+        cardsInHand: [],
+        threats: [],
+        ownUnits: [],
+        towers: this.towerStates(raw, false),
+        rawSummary: `Not in a battle (phase=${phase})`,
+      };
     }
+
+    const cardsInHand = this.resolveHand(raw, elixir);
+    const { threats, ownUnits } = this.resolveUnits(raw);
+    const timeRemaining = this.resolveClock(raw);
+    const doubleElixir = raw.doubleElixir || (timeRemaining !== undefined && timeRemaining <= 60);
+
+    const nextCard =
+      raw.nextCard && raw.nextCard.score >= CARD_MIN_SCORE && raw.nextCard.margin >= CARD_MIN_MARGIN
+        ? raw.nextCard.name
+        : undefined;
+
+    return {
+      matchPhase: phase,
+      elixir,
+      doubleElixir,
+      cardsInHand,
+      nextCard,
+      threats,
+      ownUnits,
+      towers: this.towerStates(raw, true),
+      timeRemainingSeconds: timeRemaining,
+      rawSummary:
+        `elixir=${elixir.toFixed(1)}${doubleElixir ? ' (2x)' : ''}, ` +
+        `hand=[${cardsInHand.map((c) => c.name).join(', ')}], ` +
+        `threats=${threats.length} (${threats.filter((t) => t.onOurSide).length} on our side)` +
+        (timeRemaining !== undefined ? `, clock=${timeRemaining}s` : ''),
+    };
   }
 
-  // Troop identity can't come from OCR (troops carry no readable text), so
-  // instead of guessing a name from nearby text, detect real frame-to-frame
-  // motion and report it as an unidentified threat/activity signal — true but
-  // vague beats a fabricated troop name.
-  const opponentTroops: TroopUnit[] = [];
-  const ownTroops: TroopUnit[] = [];
-  if (options.previousImagePath) {
-    try {
-      const { stdout: motionOut } = await execFileAsync(HELPER_PATH, [
-        'motion',
-        options.previousImagePath,
-        imagePath,
-      ]);
-      const motion: MotionResult = JSON.parse(motionOut.trim());
-      for (const cell of motion.cells) {
-        const troop: TroopUnit = {
-          type: 'Unidentified activity',
-          owner: cell.side === 'opponent' ? 'opponent' : 'own',
-          lane: cell.lane,
-        };
-        (cell.side === 'opponent' ? opponentTroops : ownTroops).push(troop);
+  private resolvePhase(raw: HelperState): MatchPhase {
+    const detected = raw.detectedPhase;
+    if (detected === 'post-game' || detected === 'overtime') return detected;
+    if (raw.inBattle) return 'in-progress';
+    return detected === 'menu' ? 'menu' : 'pre-game';
+  }
+
+  /**
+   * Resolves the hand from template matches.
+   *
+   * A raw top-1 match is not trusted on its own. Clash Royale renders cards you
+   * cannot afford desaturated, which measurably degrades matching and pulls the
+   * result toward a visually similar card. Two pieces of knowledge the matcher
+   * does not have are applied here to recover the right answer:
+   *
+   *  1. A deck only has eight cards. Once a card has been recognized
+   *     confidently, it is a far more likely explanation for a weak match than
+   *     some card that has never appeared.
+   *  2. A card in a slot cannot change until that slot is played, so the last
+   *     confident reading stands until the art actually changes.
+   */
+  private resolveHand(raw: HelperState, elixir: number): CardInHand[] {
+    const hand: CardInHand[] = [];
+
+    for (const match of raw.cards) {
+      const slot = match.slot as 1 | 2 | 3 | 4;
+      const confident = match.score >= CARD_MIN_SCORE && match.margin >= CARD_MIN_MARGIN;
+
+      let key = match.key;
+      let name = match.name;
+      let cost = match.elixir;
+      let type = (match.type as CardType) ?? 'unknown';
+      let resolvedConfident = confident;
+
+      if (confident) {
+        this.deckSeen.set(key, (this.deckSeen.get(key) ?? 0) + 1);
+      } else {
+        // Prefer the best-scoring candidate already known to be in this deck.
+        const inDeck = (match.alternatives ?? []).find((alt) => this.deckSeen.has(alt.key));
+        const latched = this.slotLatch.get(slot);
+
+        if (latched && (!inDeck || inDeck.key === latched.key)) {
+          // The slot has not been played, so its previous identity still holds.
+          key = latched.key;
+          name = latched.name;
+          cost = latched.elixir;
+          type = latched.type;
+          resolvedConfident = true;
+        } else if (inDeck) {
+          key = inDeck.key;
+          name = inDeck.name;
+          cost = inDeck.elixir;
+          type = (inDeck.type as CardType) ?? 'unknown';
+          resolvedConfident = true;
+        }
       }
-    } catch {
-      // Motion detection is best-effort; proceed without it if it fails.
+
+      this.slotLatch.set(slot, { key, name, elixir: cost, type });
+
+      hand.push({
+        slot,
+        key,
+        name,
+        elixirCost: cost,
+        type,
+        isPlayable: elixir >= cost,
+        recognition: { score: match.score, margin: match.margin, confident: resolvedConfident },
+      });
     }
+
+    return hand;
   }
 
-  // Tower HP: map each detected number to a tower by screen position instead
-  // of pretending every tower is always at 100%. Opponent towers are in the
-  // top half of the mirrored screen, our own in the bottom half; king towers
-  // sit in the center column, princess towers to either side.
-  const ownTowers: TowerStatus = {};
-  const opponentTowers: TowerStatus = {};
-  for (const num of ocrData.towerNumbers) {
-    const target = num.y < 0.5 ? opponentTowers : ownTowers;
-    if (num.x < 0.38) {
-      target.leftPrincessHpRaw = num.value;
-    } else if (num.x > 0.62) {
-      target.rightPrincessHpRaw = num.value;
-    } else {
-      target.kingHpRaw = num.value;
+  /** The eight cards we have confidently seen, i.e. the deck being played. */
+  public knownDeck(): string[] {
+    return [...this.deckSeen.entries()].sort((a, b) => b[1] - a[1]).map(([key]) => key);
+  }
+
+  /**
+   * Turns health bars and motion cells into located units.
+   *
+   * Tower health bars sit at fixed positions and would otherwise look like six
+   * permanent enemies. They are removed two ways: geometrically, using the known
+   * tower anchors, and statistically, by dropping any bar position that shows up
+   * in most frames (scenery and HUD elements the anchors do not cover).
+   */
+  private resolveUnits(raw: HelperState): { threats: ArenaUnit[]; ownUnits: ArenaUnit[] } {
+    const threats: ArenaUnit[] = [];
+    const ownUnits: ArenaUnit[] = [];
+
+    for (const bar of raw.healthBars) {
+      const cellKey = `${bar.owner}:${Math.round(bar.x * 40)}:${Math.round(bar.y * 40)}`;
+      this.barSightings.set(cellKey, (this.barSightings.get(cellKey) ?? 0) + 1);
+
+      if (this.isTowerBar(bar.x, bar.y)) continue;
+      if (this.isStaticBar(cellKey)) continue;
+
+      const unit: ArenaUnit = {
+        owner: bar.owner,
+        x: bar.x,
+        y: bar.y,
+        source: 'healthbar',
+        onOurSide: isOnOurSide(bar.y),
+      };
+      (bar.owner === 'opponent' ? threats : ownUnits).push(unit);
     }
-  }
 
-  return {
-    matchPhase: phase,
-    elixir,
-    cardsInHand: handCards,
-    nextCard: nextCard.name,
-    opponentTroops: opponentTroops.slice(0, 6),
-    ownTroops: ownTroops.slice(0, 6),
-    ownTowers,
-    opponentTowers,
-    handTrackingConfidence,
-    rawSummary: `Local perception: Phase=${phase}, Elixir=${elixir}, OpponentActivity=${opponentTroops.length}, HandConfidence=${handTrackingConfidence}`,
-  };
-}
+    this.trackVelocities([...threats, ...ownUnits]);
 
-/**
- * Cloud Vision Perceiver using OpenAI GPT-4o / GPT-4o-mini API (optional).
- */
-export async function perceiveGameStateWithOpenAI(
-  imageBase64: string,
-  apiKey: string,
-  model = 'gpt-4o-mini'
-): Promise<GameState> {
-  const openai = new OpenAI({ apiKey });
-
-  const systemPrompt = `You are a real-time Clash Royale game state perceiver.
-Analyze the provided screenshot of the Clash Royale match running in iPhone Mirroring.
-Output ONLY valid, raw JSON (no conversational text, no backticks).
-Schema:
-{
-  "matchPhase": "pre-game" | "in-progress" | "overtime" | "post-game" | "menu",
-  "elixir": number (0-10),
-  "cardsInHand": [{ "slot": 1|2|3|4, "name": string, "elixirCost": number, "isPlayable": boolean }],
-  "nextCard": string | null,
-  "opponentTroops": [{ "type": string, "lane": "left"|"right"|"center", "approxHpPercent": number }],
-  "ownTroops": [{ "type": string, "lane": "left"|"right"|"center", "approxHpPercent": number }],
-  "ownTowers": { "leftPrincessHpPercent": number, "rightPrincessHpPercent": number, "kingHpPercent": number },
-  "opponentTowers": { "leftPrincessHpPercent": number, "rightPrincessHpPercent": number, "kingHpPercent": number },
-  "rawSummary": string
-}`;
-
-  const response = await openai.chat.completions.create({
-    model,
-    max_tokens: 1024,
-    temperature: 0.1,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'image_url',
-            image_url: {
-              url: `data:image/png;base64,${imageBase64}`,
-            },
-          },
-          {
-            type: 'text',
-            text: 'Extract current Clash Royale game state as JSON.',
-          },
-        ],
-      },
-    ],
-  });
-
-  const rawText = response.choices[0]?.message?.content || '';
-  let cleaned = rawText.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-  }
-
-  return JSON.parse(cleaned) as GameState;
-}
-
-/**
- * Cloud Vision Perceiver using Anthropic Claude API (optional).
- */
-export async function perceiveGameStateWithClaude(
-  imageBase64: string,
-  apiKey: string,
-  model = 'claude-haiku-4-5-20251001'
-): Promise<GameState> {
-  const anthropic = new Anthropic({ apiKey });
-
-  const systemPrompt = `You are a real-time Clash Royale game state perceiver.
-Analyze the provided screenshot of the Clash Royale match running in iPhone Mirroring.
-Output ONLY valid, raw JSON (no conversational text, no backticks).
-Schema:
-{
-  "matchPhase": "pre-game" | "in-progress" | "overtime" | "post-game" | "menu",
-  "elixir": number (0-10),
-  "cardsInHand": [{ "slot": 1|2|3|4, "name": string, "elixirCost": number, "isPlayable": boolean }],
-  "nextCard": string | null,
-  "opponentTroops": [{ "type": string, "lane": "left"|"right"|"center", "approxHpPercent": number }],
-  "ownTroops": [{ "type": string, "lane": "left"|"right"|"center", "approxHpPercent": number }],
-  "ownTowers": { "leftPrincessHpPercent": number, "rightPrincessHpPercent": number, "kingHpPercent": number },
-  "opponentTowers": { "leftPrincessHpPercent": number, "rightPrincessHpPercent": number, "kingHpPercent": number },
-  "rawSummary": string
-}`;
-
-  const response = await anthropic.messages.create({
-    model,
-    max_tokens: 1024,
-    temperature: 0.1,
-    system: systemPrompt,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: 'image/png',
-              data: imageBase64,
-            },
-          },
-          {
-            type: 'text',
-            text: 'Extract current Clash Royale game state as JSON.',
-          },
-        ],
-      },
-    ],
-  });
-
-  const rawText = response.content
-    .filter((block) => block.type === 'text')
-    .map((block) => ('text' in block ? block.text : ''))
-    .join('')
-    .trim();
-
-  let cleaned = rawText.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-  }
-
-  return JSON.parse(cleaned) as GameState;
-}
-
-/**
- * Universal perceiver: supports OpenAI, Claude, and local on-device Apple Vision.
- * Automatically falls back to local vision if quota or network errors occur.
- */
-export async function perceiveGameState(
-  imagePath: string,
-  imageBase64: string,
-  options: PerceiveOptions = {}
-): Promise<GameState> {
-  const provider =
-    options.provider ||
-    (process.env.VISION_PROVIDER as 'local' | 'anthropic' | 'openai') ||
-    (process.env.OPENAI_API_KEY ? 'openai' : process.env.ANTHROPIC_API_KEY ? 'anthropic' : 'local');
-
-  const tracker = options.deckTracker || new DeckTracker();
-
-  // 1. OpenAI Vision
-  if (provider === 'openai' && (options.openAiApiKey || process.env.OPENAI_API_KEY)) {
-    const key = options.openAiApiKey || process.env.OPENAI_API_KEY!;
-    try {
-      return await perceiveGameStateWithOpenAI(imageBase64, key, options.visionModel || process.env.VISION_MODEL || 'gpt-4o-mini');
-    } catch (err) {
-      console.warn(
-        `[perceive:openai] OpenAI vision call failed (${(err as Error).message}). Falling back to local Apple Vision.`
+    // Motion deliberately does not create units of its own. Frame differencing
+    // says that something moved, never who owns it, and our own troops walking
+    // up our half move just as much as an attacker does - treating that as an
+    // incoming push makes the agent defend against itself. Motion is instead
+    // used to corroborate a health bar we already found, marking which detected
+    // units are actually advancing rather than standing still.
+    for (const unit of [...threats, ...ownUnits]) {
+      const nearby = raw.motion.filter(
+        (cell) => Math.hypot(unit.x - cell.x, unit.y - cell.y) < 0.09
       );
-      return perceiveGameStateLocally(imagePath, tracker, options);
+      if (nearby.length > 0) {
+        unit.intensity = Math.max(...nearby.map((cell) => cell.intensity));
+      }
     }
+
+    // Most urgent first: deepest into our half.
+    threats.sort((a, b) => b.y - a.y);
+    return { threats, ownUnits };
   }
 
-  // 2. Anthropic Claude Vision
-  if (provider === 'anthropic' && (options.anthropicApiKey || process.env.ANTHROPIC_API_KEY)) {
-    const key = options.anthropicApiKey || process.env.ANTHROPIC_API_KEY!;
-    try {
-      return await perceiveGameStateWithClaude(imageBase64, key, options.visionModel || process.env.VISION_MODEL);
-    } catch (err) {
-      console.warn(
-        `[perceive:anthropic] Anthropic vision call failed (${(err as Error).message}). Falling back to local Apple Vision.`
-      );
-      return perceiveGameStateLocally(imagePath, tracker, options);
+  /**
+   * Measures how fast each unit is moving by matching it to the nearest unit of
+   * the same owner in the previous frame.
+   *
+   * Nearest-neighbour matching is crude and will occasionally swap two units
+   * that pass close to each other, so the result is capped at a plausible troop
+   * speed rather than trusted blindly. It only needs to be good enough to lead a
+   * spell by about a second.
+   */
+  private trackVelocities(units: ArenaUnit[]): void {
+    const now = Date.now();
+    const elapsed = this.lastUnitsAt ? (now - this.lastUnitsAt) / 1000 : 0;
+
+    if (this.lastUnits && elapsed > 0.05 && elapsed < 2.0) {
+      for (const unit of units) {
+        let nearest: ArenaUnit | undefined;
+        let nearestDistance = Infinity;
+        for (const previous of this.lastUnits) {
+          if (previous.owner !== unit.owner) continue;
+          const distance = Math.hypot(previous.x - unit.x, previous.y - unit.y);
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = previous;
+          }
+        }
+        // Too far to plausibly be the same unit one frame later.
+        if (!nearest || nearestDistance > 0.12) continue;
+
+        const vx = (unit.x - nearest.x) / elapsed;
+        const vy = (unit.y - nearest.y) / elapsed;
+        const speed = Math.hypot(vx, vy);
+        // The fastest troops cross the arena in roughly ten seconds, so
+        // anything above this is a tracking error, not a unit.
+        if (speed > 0.35) continue;
+        unit.velocity = { x: vx, y: vy };
+      }
     }
+
+    this.lastUnits = units.map((u) => ({ ...u }));
+    this.lastUnitsAt = now;
   }
 
-  // 3. Default: Local on-device Apple Vision (Zero Keys Required!)
-  return perceiveGameStateLocally(imagePath, tracker, options);
+  private isTowerBar(x: number, y: number): boolean {
+    return TOWER_ANCHORS.some(
+      (anchor) => Math.abs(anchor.x - x) < 0.11 && Math.abs(anchor.y - y) < 0.075
+    );
+  }
+
+  private isStaticBar(cellKey: string): boolean {
+    // Needs a warm-up before the ratio means anything.
+    if (this.framesSeen < 8) return false;
+    const seen = this.barSightings.get(cellKey) ?? 0;
+    return seen / this.framesSeen > 0.6;
+  }
+
+  /**
+   * The clock only updates on OCR passes, so it is extrapolated in between
+   * using elapsed wall-clock time. This is what lets OCR run occasionally
+   * instead of on every frame without losing track of double elixir.
+   */
+  private resolveClock(raw: HelperState): number | undefined {
+    if (raw.timeRemainingSeconds !== undefined) {
+      this.lastClockSeconds = raw.timeRemainingSeconds;
+      this.lastClockAt = Date.now();
+      return raw.timeRemainingSeconds;
+    }
+    if (this.lastClockSeconds === undefined || this.lastClockAt === undefined) return undefined;
+    const elapsed = (Date.now() - this.lastClockAt) / 1000;
+    return Math.max(0, Math.round(this.lastClockSeconds - elapsed));
+  }
+
+  /**
+   * Maps OCR'd hit-point numbers onto the six towers by position.
+   *
+   * Hit points only ever decrease, so a reading that jumps upward is an OCR
+   * misread (a dropped digit turns 3052 into 305) and is discarded. A tower
+   * that stops reporting a number after having reported one has been destroyed.
+   */
+  private towerStates(raw: HelperState, inBattle: boolean): TowerState[] {
+    // Outside a battle the arena is not on screen, so any number OCR finds is
+    // menu chrome, not a tower. Ingesting it would invent tower hit points from
+    // the home screen. Leaving a battle also clears the table, so the next match
+    // does not inherit the previous one's tower state.
+    if (!inBattle) {
+      if (this.towerHp.size > 0) {
+        this.towerHp.clear();
+        this.towerSeen.clear();
+      }
+      return TOWER_ANCHORS.map((anchor) => ({
+        side: anchor.side,
+        position: anchor.position,
+        standing: true,
+      }));
+    }
+
+    for (const number of raw.towerNumbers) {
+      let nearest: (typeof TOWER_ANCHORS)[number] | null = null;
+      let nearestDistance = Infinity;
+      for (const anchor of TOWER_ANCHORS) {
+        // Hit-point labels are drawn just above their tower.
+        const distance = Math.hypot(anchor.x - number.x, anchor.y - 0.03 - number.y);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearest = anchor;
+        }
+      }
+      if (!nearest || nearestDistance > 0.12) continue;
+
+      const id = `${nearest.side}:${nearest.position}`;
+      const previous = this.towerHp.get(id);
+      if (previous !== undefined && number.value > previous * 1.02) continue;
+      this.towerHp.set(id, number.value);
+      this.towerSeen.set(id, this.ocrPasses);
+    }
+
+    return TOWER_ANCHORS.map((anchor) => {
+      const id = `${anchor.side}:${anchor.position}`;
+      const hp = this.towerHp.get(id);
+      const lastSeen = this.towerSeen.get(id);
+      // Only call a tower destroyed once we had been reading it and then stopped.
+      const standing =
+        !inBattle || hp === undefined || lastSeen === undefined
+          ? true
+          : this.ocrPasses - lastSeen < 3;
+      return { side: anchor.side, position: anchor.position, hp, standing };
+    });
+  }
 }

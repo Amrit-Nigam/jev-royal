@@ -24,9 +24,14 @@ export function ensureCapturesDir(dir = DEFAULT_CAPTURES_DIR): void {
 
 /**
  * Cleans up old frames to prevent disk space bloat.
+ *
+ * Pass keepLatest = 0 to disable pruning entirely. Recording sessions do this,
+ * because footage of a real match is the scarce input for tuning perception and
+ * must not be silently overwritten by a later run.
  */
 export function pruneOldCaptures(dir = DEFAULT_CAPTURES_DIR, keepLatest = 20): void {
   try {
+    if (keepLatest === 0) return;
     if (!existsSync(dir)) return;
     const files = readdirSync(dir)
       .filter((f) => f.endsWith('.png'))

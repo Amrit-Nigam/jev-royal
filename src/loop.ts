@@ -2,9 +2,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { executePlay } from './act.js';
 import { captureWindow } from './capture.js';
 import { decideMove } from './decide.js';
-import { DeckTracker } from './deck.js';
-import { perceiveGameState } from './perceive.js';
-import type { GameState, TickResult, WindowInfo } from './types.js';
+import { Perceiver } from './perceive.js';
+import type { TickResult, WindowInfo } from './types.js';
 import { findTargetWindow } from './window.js';
 
 export interface LoopOptions {
@@ -13,226 +12,230 @@ export interface LoopOptions {
   dryRun?: boolean;
   maxTicks?: number;
   autoStopOnPostGame?: boolean;
-  deckNames?: string[];
+  localOnly?: boolean;
+  /**
+   * Write every frame to this directory instead of the rolling capture buffer,
+   * with pruning disabled. Match footage is the scarce input for tuning
+   * perception, so a recording session must never be overwritten by a later run.
+   */
+  recordDir?: string;
   onTick?: (result: TickResult) => void;
 }
+
+/**
+ * How often the slower OCR pass runs. The things OCR reads (the match clock and
+ * tower hit points) change slowly and are tracked between passes, so running it
+ * on every frame would roughly double perception latency for no benefit.
+ */
+const OCR_EVERY_N_TICKS = 6;
 
 export class GameLoop {
   private isRunning = false;
   private tickCount = 0;
   private readonly options: LoopOptions;
-  private deckTracker: DeckTracker;
+  private perceiver = new Perceiver();
   private previousFramePath?: string;
-  private previousElixir?: number;
-  private previousPlayCost?: number;
 
   constructor(options: LoopOptions = {}) {
     this.options = {
       windowQuery: 'iPhone Mirroring',
-      tickIntervalMs: Number(process.env.TICK_INTERVAL_MS) || 2000,
+      // Clash Royale punishes slow reactions, so the loop runs far faster than
+      // a "read the board and think" cadence would suggest.
+      tickIntervalMs: Number(process.env.TICK_INTERVAL_MS) || 700,
       dryRun: false,
       autoStopOnPostGame: true,
       ...options,
     };
-
-    const envDeck = process.env.PLAYER_DECK
-      ? process.env.PLAYER_DECK.split(',').map((s) => s.trim())
-      : undefined;
-    this.deckTracker = new DeckTracker(this.options.deckNames || envDeck);
   }
 
   public stop(): void {
-    console.log('\n[loop] Stopping game loop...');
+    console.log('\n[loop] stopping...');
     this.isRunning = false;
   }
 
-  /**
-   * Executes a single game tick.
-   */
   public async executeSingleTick(windowInfo: WindowInfo): Promise<TickResult> {
     this.tickCount++;
     const tickNumber = this.tickCount;
     const timestamp = Date.now();
 
-    console.log(`\n--- [Tick #${tickNumber}] ---`);
-
-    // 1. Capture window screenshot
-    const { filePath, base64 } = await captureWindow(windowInfo.id);
-    console.log(`[capture] Captured window frame: ${filePath}`);
+    const captureStart = Date.now();
+    const { filePath } = await captureWindow(
+      windowInfo.id,
+      this.options.recordDir ? { outputDir: this.options.recordDir, maxStoredFrames: 0 } : {}
+    );
+    const captureMs = Date.now() - captureStart;
     const priorFramePath = this.previousFramePath;
     this.previousFramePath = filePath;
 
-    // 2. Perceive board state
-    console.log('[perceive] Analyzing frame with vision...');
-    let gameState: GameState;
+    let gameState;
+    const perceiveStart = Date.now();
     try {
-      gameState = await perceiveGameState(filePath, base64, {
-        deckTracker: this.deckTracker,
+      gameState = await this.perceiver.perceive(filePath, {
         previousImagePath: priorFramePath,
-        previousElixir: this.previousElixir,
-        previousPlayCost: this.previousPlayCost,
+        runOcr: tickNumber === 1 || tickNumber % OCR_EVERY_N_TICKS === 0,
       });
-      this.previousElixir = gameState.elixir;
-      console.log(
-        `[perceive] Phase: ${gameState.matchPhase.toUpperCase()} | Elixir: ${gameState.elixir.toFixed(1)} | Hand: [${gameState.cardsInHand.map((c) => c.name).join(', ')}]${gameState.handTrackingConfidence === 'low' ? ' (LOW CONFIDENCE - possible desync)' : ''}`
-      );
-      if (gameState.opponentTroops.length > 0) {
-        console.log(
-          `[perceive] Opponent activity: ${gameState.opponentTroops.map((t) => `${t.type} (${t.lane})`).join(', ')}`
-        );
-      }
     } catch (err) {
-      console.error(`[perceive] Error perceiving game state: ${(err as Error).message}`);
-      return {
+      return this.emit({
         tickNumber,
         timestamp,
         screenshotPath: filePath,
         gameState: {
           matchPhase: 'in-progress',
-          elixir: 5,
+          elixir: 0,
+          doubleElixir: false,
           cardsInHand: [],
-          opponentTroops: [],
-          ownTroops: [],
-          ownTowers: {},
-          opponentTowers: {},
+          threats: [],
+          ownUnits: [],
+          towers: [],
         },
-        error: `Perception failed: ${(err as Error).message}`,
-      };
+        error: `perception failed: ${(err as Error).message}`,
+        timings: {
+          captureMs,
+          perceiveMs: Date.now() - perceiveStart,
+          decideMs: 0,
+          totalMs: Date.now() - timestamp,
+        },
+      });
     }
+    const perceiveMs = Date.now() - perceiveStart;
 
-    // Check if match is post-game or not in progress
-    if (this.options.autoStopOnPostGame && gameState.matchPhase === 'post-game') {
-      console.log('[perceive] Match has concluded (post-game detected)!');
-      return {
+    const timings = (decideMs: number) => ({
+      captureMs,
+      perceiveMs,
+      decideMs,
+      totalMs: Date.now() - timestamp,
+    });
+
+    if (gameState.matchPhase === 'post-game') {
+      console.log('[loop] match over');
+      return this.emit({
         tickNumber,
         timestamp,
         screenshotPath: filePath,
         gameState,
-        skippedReason: 'Match finished (post-game phase)',
-      };
+        skippedReason: 'post-game',
+        timings: timings(0),
+      });
     }
 
     if (gameState.matchPhase === 'menu' || gameState.matchPhase === 'pre-game') {
-      console.log(`[loop] Waiting for battle to start (current phase: ${gameState.matchPhase})...`);
-      return {
+      // Quiet in the log, but still published: the dashboard needs to show that
+      // we are alive and waiting rather than appearing frozen between matches.
+      return this.emit({
         tickNumber,
         timestamp,
         screenshotPath: filePath,
         gameState,
-        skippedReason: `Waiting in ${gameState.matchPhase}`,
-      };
+        skippedReason: `waiting in ${gameState.matchPhase}`,
+        timings: timings(0),
+      });
     }
 
-    // 3. Decide move with TypeSafe Jev
-    console.log('[decide] Consulting TypeSafe Jev model...');
-    const decision = await decideMove(gameState);
-    console.log(`[decide] ${decision.explanation || 'Decision received.'}`);
+    console.log(`[tick ${tickNumber}] ${gameState.rawSummary}`);
 
-    // 4. Act (simulate clicks)
-    let actionTaken;
-    this.previousPlayCost = 0;
-    if (decision.shouldPlayNow && decision.whichCard !== 'none') {
-      const coords = await executePlay(windowInfo.bounds, decision, {
-        dryRun: this.options.dryRun,
-      });
+    const decideStart = Date.now();
+    const decision = await decideMove(gameState, { localOnly: this.options.localOnly });
+    const decideMs = Date.now() - decideStart;
 
+    let actionTaken: TickResult['actionTaken'];
+    if (decision.shouldPlayNow && decision.action) {
+      const coords = await executePlay(windowInfo.bounds, decision, { dryRun: this.options.dryRun });
       if (coords) {
-        const slotMatch = decision.whichCard.match(/\d+/);
-        const slotNum = slotMatch ? parseInt(slotMatch[0], 10) : 1;
-        const cardObj = gameState.cardsInHand.find((c) => c.slot === slotNum);
-        this.previousPlayCost = cardObj?.elixirCost ?? 0;
-
-        // Rotate deck cycle
-        const rotatedCard = this.deckTracker.playSlot(slotNum);
-        console.log(`[deck] Played ${rotatedCard?.name || `Slot ${slotNum}`}, rotating deck cycle.`);
-
         actionTaken = {
-          cardSlot: slotNum,
-          cardName: cardObj?.name || decision.whichCard,
-          placement: decision.whichLane,
+          cardSlot: decision.action.card.slot,
+          cardName: decision.action.card.name,
+          placement: decision.action.placement,
           screenCoords: coords,
         };
       }
+      console.log(`[decide:${decision.source}] ${decision.explanation}`);
     } else {
-      console.log('[act] Holding elixir, no card played this tick.');
+      console.log(`[decide:${decision.source}] holding - ${decision.explanation}`);
     }
 
-    const result: TickResult = {
+    return this.emit({
       tickNumber,
       timestamp,
       screenshotPath: filePath,
       gameState,
       decision,
       actionTaken,
-    };
+      timings: timings(decideMs),
+    });
+  }
 
-    if (this.options.onTick) {
-      this.options.onTick(result);
-    }
-
+  /** Publishes a tick to any observer (the dashboard) and returns it. */
+  private emit(result: TickResult): TickResult {
+    this.options.onTick?.(result);
     return result;
   }
 
-  /**
-   * Main game loop runner.
-   */
   public async run(): Promise<void> {
     this.isRunning = true;
     console.log('=====================================================');
-    console.log('🚀 Jev Clash Royale Autonomous Agent Initialized');
-    console.log(`   Tick interval: ${this.options.tickIntervalMs}ms`);
-    console.log(`   Dry run mode: ${this.options.dryRun ? 'ENABLED' : 'DISABLED'}`);
+    console.log('Jev Clash Royale agent');
+    console.log(`  tick interval : ${this.options.tickIntervalMs}ms`);
+    console.log(`  dry run       : ${this.options.dryRun ? 'yes' : 'no'}`);
+    console.log(`  decisions     : ${this.options.localOnly ? 'local tactics only' : 'local tactics + Jev'}`);
     console.log('=====================================================');
 
-    // Handle Ctrl+C gracefully
-    const sigHandler = () => {
-      this.stop();
-    };
+    const sigHandler = () => this.stop();
     process.on('SIGINT', sigHandler);
     process.on('SIGTERM', sigHandler);
 
     while (this.isRunning) {
-      // Check maximum tick bound if provided
       if (this.options.maxTicks && this.tickCount >= this.options.maxTicks) {
-        console.log(`[loop] Reached maximum ticks (${this.options.maxTicks}). Exiting.`);
+        console.log(`[loop] reached ${this.options.maxTicks} ticks, exiting`);
         break;
       }
 
-      // Step 1: Locate the window
       const windowInfo = await findTargetWindow(this.options.windowQuery);
       if (!windowInfo) {
-        console.warn(
-          `[loop] Target window "${this.options.windowQuery}" not found. Waiting 3s... (Make sure iPhone Mirroring is open)`
-        );
+        console.warn(`[loop] "${this.options.windowQuery}" not found; is iPhone Mirroring open? retrying in 3s`);
+        // Report this rather than going silent, so an observer shows "waiting
+        // for the window" instead of looking like the agent has hung.
+        this.emit({
+          tickNumber: this.tickCount,
+          timestamp: Date.now(),
+          screenshotPath: '',
+          gameState: {
+            matchPhase: 'menu',
+            elixir: 0,
+            doubleElixir: false,
+            cardsInHand: [],
+            threats: [],
+            ownUnits: [],
+            towers: [],
+          },
+          skippedReason: `waiting for "${this.options.windowQuery}"`,
+        });
         await sleep(3000);
         continue;
       }
 
+      const startedAt = Date.now();
       try {
         const tickResult = await this.executeSingleTick(windowInfo);
-
-        // Stop condition on post-game
-        if (
-          this.options.autoStopOnPostGame &&
-          tickResult.gameState.matchPhase === 'post-game'
-        ) {
-          console.log('[loop] Match ended. Exiting loop.');
+        if (this.options.autoStopOnPostGame && tickResult.gameState.matchPhase === 'post-game') {
           break;
         }
       } catch (err) {
-        console.error(`[loop] Error during tick #${this.tickCount}: ${(err as Error).message}`);
-        console.log('[loop] Continuing to next tick in 3s...');
-        await sleep(3000);
+        console.error(`[loop] tick ${this.tickCount} failed: ${(err as Error).message}`);
+        await sleep(1000);
         continue;
       }
 
       if (this.isRunning) {
-        await sleep(this.options.tickIntervalMs ?? 2000);
+        // Pace against how long the tick actually took, so a slow perception
+        // pass does not stack on top of the interval and halve our reaction rate.
+        const elapsed = Date.now() - startedAt;
+        const remaining = (this.options.tickIntervalMs ?? 700) - elapsed;
+        if (remaining > 0) await sleep(remaining);
       }
     }
 
     process.off('SIGINT', sigHandler);
     process.off('SIGTERM', sigHandler);
-    console.log(`[loop] Game loop finished. Total ticks executed: ${this.tickCount}`);
+    console.log(`[loop] finished after ${this.tickCount} ticks`);
   }
 }

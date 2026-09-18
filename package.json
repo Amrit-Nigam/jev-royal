@@ -6,12 +6,18 @@
   "scripts": {
     "build": "tsc",
     "start": "tsx src/index.ts",
-    "test": "tsx test/test_decide.ts && tsx test/test_offense.ts && tsx test/test_act.ts",
-    "test:local": "tsx test/test_local_pipeline.ts",
-    "capture-test": "tsx src/index.ts --capture-only",
+    "test": "tsx test/test_tactics.ts && tsx test/test_perceive.ts",
     "dry-run": "tsx src/index.ts --dry-run",
     "list-windows": "tsx src/index.ts --list-windows",
-    "compile-native": "swiftc native/helper.swift -o bin/helper"
+    "compile-native": "swiftc native/helper.swift -o bin/helper",
+    "test:tactics": "tsx test/test_tactics.ts",
+    "test:perceive": "tsx test/test_perceive.ts",
+    "build-card-index": "python3 tools/build_card_index.py",
+    "local": "tsx src/index.ts --local-only",
+    "capture": "tsx src/index.ts --capture-only",
+    "fetch-card-assets": "bash tools/fetch_card_assets.sh",
+    "dev": "tsx src/index.ts --dashboard",
+    "dev:dry": "tsx src/index.ts --dashboard --dry-run"
   },
   "keywords": [
     "clash-royale",
